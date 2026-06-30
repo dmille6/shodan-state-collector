@@ -1,0 +1,18 @@
+# Secrets / config — never commit
+.env
+
+# The archive: sensitive third-party exposure data, large, irreplaceable.
+# Keep it out of git entirely. Back it up out-of-band instead.
+daily_downloads/
+
+# Python virtualenv (rebuildable from requirements.txt)
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Any stray Shodan credential files
+*api_key*
+.config/

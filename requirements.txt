@@ -1,0 +1,4 @@
+shodan
+# shodan 1.31 still imports pkg_resources, which setuptools >=81 removed.
+# Pin below 81 so the CLI runs on Python 3.12+ (incl. 3.14) without ImportError.
+setuptools<81
