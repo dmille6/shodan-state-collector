@@ -16,6 +16,10 @@
 #
 set -euo pipefail
 
+# Silence the (harmless) pkg_resources deprecation warning shodan 1.31 emits,
+# so it doesn't clutter the log on every run.
+export PYTHONWARNINGS="ignore::UserWarning"
+
 # --- Resolve this script's own directory (portable; no hard-coded paths) ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -35,12 +39,70 @@ SHODAN_ORG_NAME="${SHODAN_ORG_NAME:-$SHODAN_STATE_NAME}"  # org search term for 
 OUTPUT_SUBDIR="${OUTPUT_DIR:-daily_downloads}"         # subfolder (under this dir) for the archive
 RETENTION_DAYS="${RETENTION_DAYS:-0}"                  # delete archives older than N days; 0 = keep forever
 VENV_DIR="${VENV_DIR:-$SCRIPT_DIR/venv}"               # virtualenv holding the shodan CLI
+MAX_DOWNLOAD_ATTEMPTS="${MAX_DOWNLOAD_ATTEMPTS:-3}"    # retries when a download comes back truncated
+MIN_COMPLETENESS_PCT="${MIN_COMPLETENESS_PCT:-90}"     # a download is "complete" if saved >= this % of count
+RETRY_SLEEP="${RETRY_SLEEP:-30}"                       # seconds to wait between download retries
 
 DAILY_DIR="$SCRIPT_DIR/$OUTPUT_SUBDIR"
 LOG_FILE="$SCRIPT_DIR/shodan_collection.log"
 SHODAN_CMD="$VENV_DIR/bin/shodan"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"; }
+
+# download_query <query> <dest.json.gz>
+# Downloads a query to <dest>, guarding against Shodan's silent partial downloads.
+# Shodan occasionally drops the connection mid-download and saves only part of the
+# result set while still exiting 0 (it just prints a soft "fewer results were saved"
+# notice — which it ALSO prints on a 99.9%-complete download, so that notice alone
+# is not a reliable failure signal). We instead compare the saved record count
+# against a free `shodan count`, and retry if it's well short. The best (largest)
+# attempt is kept. Sets global DL_SAVED to the saved count; returns 0 if complete,
+# 1 if still short after all attempts.
+download_query() {
+    local query="$1" dest="$2"
+    local expected saved best_saved=-1 attempt tmp
+    DL_SAVED=0
+
+    # `shodan count` is free (no query-credit cost) — our reference for "how many
+    # results should we have gotten". Strip to digits; default 0 if it fails.
+    expected="$("$SHODAN_CMD" count "$query" 2>/dev/null | tr -dc '0-9')"
+    expected="${expected:-0}"
+
+    for attempt in $(seq 1 "$MAX_DOWNLOAD_ATTEMPTS"); do
+        # NOTE: the Shodan CLI appends ".json.gz" unless the name already ends in
+        # it, so the temp name MUST end in .json.gz or the file lands elsewhere.
+        tmp="${dest%.json.gz}.attempt${attempt}.json.gz"
+        if "$SHODAN_CMD" download "$tmp" --limit -1 "$query" >>"$LOG_FILE" 2>&1; then
+            saved="$(zcat "$tmp" 2>/dev/null | wc -l)"
+        else
+            saved=0
+            log "  attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}: shodan download returned an error"
+        fi
+
+        # Keep whichever attempt yielded the most records.
+        if [ "$saved" -gt "$best_saved" ]; then
+            best_saved="$saved"; mv -f "$tmp" "$dest"
+        else
+            rm -f "$tmp"
+        fi
+        DL_SAVED="$best_saved"
+
+        # Complete if we can't get a reference count, or saved >= MIN_COMPLETENESS_PCT% of it.
+        if [ "$expected" -le 0 ] || [ $(( saved * 100 )) -ge $(( expected * MIN_COMPLETENESS_PCT )) ]; then
+            log "  attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}: saved ${saved} of ~${expected} (complete)"
+            return 0
+        fi
+
+        log "  attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}: saved ${saved} of ~${expected} — partial (<${MIN_COMPLETENESS_PCT}%)"
+        if [ "$attempt" -lt "$MAX_DOWNLOAD_ATTEMPTS" ]; then
+            log "  retrying in ${RETRY_SLEEP}s..."
+            sleep "$RETRY_SLEEP"
+        fi
+    done
+
+    log "  WARNING: query still incomplete after ${MAX_DOWNLOAD_ATTEMPTS} attempts: best ${best_saved} of ~${expected}"
+    return 1
+}
 
 # --- Preflight checks ---
 if [ ! -x "$SHODAN_CMD" ]; then
@@ -84,24 +146,24 @@ fi
 
 log "Output file: $output_path"
 
-# --- Download each query to a temp file ---
+# --- Download each query (with retry on partial) to a temp file ---
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 part_files=()
+incomplete=false   # set true if any query stays short after all retries
 i=0
 for q in "${QUERIES[@]}"; do
     part="$work_dir/part_${i}.json.gz"
     log "Running query[$i]: $q"
-    if "$SHODAN_CMD" download "$part" --limit -1 "$q"; then
-        if [ -s "$part" ]; then
-            part_files+=("$part")
-        else
-            log "WARNING: query[$i] returned no results"
-        fi
+    if ! download_query "$q" "$part"; then
+        incomplete=true   # we keep the best partial, but flag the day as incomplete
+    fi
+    if [ -s "$part" ]; then
+        part_files+=("$part")
     else
-        log "ERROR: shodan download failed for query[$i]: $q"
+        log "WARNING: query[$i] returned no results"
         if [ "$i" -eq 0 ]; then
-            log "ERROR: primary geo query failed — aborting."
+            log "ERROR: primary geo query produced no data — aborting."
             exit 1
         fi
     fi
@@ -136,20 +198,28 @@ fi
 record_count="${record_count:-0}"
 
 # --- Report result ---
-if [ "$record_count" -gt 0 ]; then
-    file_size=$(stat -c%s "$output_path" 2>/dev/null || echo "?")
-    log "Wrote $record_count unique records to $output_filename (${file_size} bytes)"
-else
+if [ "$record_count" -le 0 ]; then
     # A zero-record delta day is suspicious — it was the symptom of the ISO-date bug.
     rm -f "$output_path"
     log "WARNING: 0 records collected for $current_date (all queries empty). Check the query window and API."
     exit 2
 fi
 
+file_size=$(stat -c%s "$output_path" 2>/dev/null || echo "?")
+log "Wrote $record_count unique records to $output_filename (${file_size} bytes)"
+
 # --- Optional retention cleanup ---
 if [ "$RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
     deleted=$(find "$DAILY_DIR" -name "${SHODAN_STATE_NAME}-events-*.json.gz" -mtime "+${RETENTION_DAYS}" -print -delete | wc -l)
     [ "$deleted" -gt 0 ] && log "Retention: deleted $deleted archive(s) older than ${RETENTION_DAYS} days"
+fi
+
+# A file was written, but if any query stayed short after all retries the day is
+# only partially complete — keep the data, but exit non-zero so cron/monitoring
+# flags it instead of treating a truncated day as a clean success.
+if [ "$incomplete" = true ]; then
+    log "WARNING: collection for $current_date is PARTIAL (a query stayed below ${MIN_COMPLETENESS_PCT}% after ${MAX_DOWNLOAD_ATTEMPTS} attempts). Data kept; flagging for review."
+    exit 3
 fi
 
 log "Done."

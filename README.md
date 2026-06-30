@@ -28,14 +28,27 @@ The window is `after:<yesterday> before:<tomorrow>` formatted as **DD/MM/YYYY**
 
 ---
 
+## Two collectors
+
+| Collector | Use |
+|---|---|
+| **`shodan_collect.py`** (recommended) | Python; paginates the API directly with per-page retry, ~1 req/sec pacing, atomic writes, and `--date` backfill. More reliable — handles the throttling/partial-download failures the CLI hides. |
+| `shodan_query.sh` | Original bash wrapper around the `shodan download` CLI. Kept as a fallback. |
+
+Both read the same `.env`, produce the same gzipped-NDJSON output, and dedupe by
+banner hash. See [ROADMAP.md](ROADMAP.md) for why the Python collector exists and
+where the project is headed.
+
 ## Layout
 
 ```
 .
-├── shodan_query.sh      # the collector (portable, .env-driven)
+├── shodan_collect.py    # recommended collector (Python, robust)
+├── shodan_query.sh      # original collector (bash + CLI, fallback)
 ├── .env                 # your config (gitignored — never commit)
 ├── .env.example         # config template (defaults to Louisiana)
-├── requirements.txt     # shodan
+├── requirements.txt     # shodan, setuptools<81
+├── ROADMAP.md           # long-term direction
 ├── daily_downloads/     # the archive (gitignored — keep private, back up)
 └── venv/                # virtualenv (gitignored)
 ```
@@ -64,7 +77,13 @@ cp .env.example .env          # then edit .env to choose the state
 ## Usage
 
 ```bash
-# Run the collector manually
+# Collect today's delta (recommended collector)
+./venv/bin/python shodan_collect.py
+
+# Backfill a specific day (e.g. after a failed/partial run)
+./venv/bin/python shodan_collect.py --date 2026-06-29
+
+# Fallback: the original bash/CLI collector
 bash shodan_query.sh
 ```
 
@@ -75,11 +94,12 @@ inline in `.env.example`.
 ## Daily cron (runs as the owning user, e.g. mike)
 
 ```cron
-30 23 * * * /bin/bash /opt/shodan_query/shodan_query.sh >> /opt/shodan_query/cron.log 2>&1
+30 23 * * * /opt/shodan_query/venv/bin/python /opt/shodan_query/shodan_collect.py >> /opt/shodan_query/cron.log 2>&1
 ```
 
 Exit codes: `0` success, `1` setup/primary-query failure, `2` zero records
-collected (suspicious — investigate).
+collected (suspicious — investigate), `3` partial (a page was lost or the fetch
+came back below `MIN_COMPLETENESS_PCT`; data is kept but flagged for review).
 
 ---
 
@@ -103,6 +123,17 @@ collected (suspicious — investigate).
 5. **Org-name matching is unreliable.** `org:<name>` can match firms in other
    states. The org-rescue query is most reliable for states whose name appears in
    org names (e.g. Louisiana); set `SHODAN_ORG_RESCUE=false` otherwise.
+
+6. **~40% of raw search results are duplicate hashes.** Shodan returns the same
+   banner across multiple pages, so a *complete* download of ~31k reported results
+   yields only ~19k unique records after dedup. Measure download completeness by
+   **raw banners fetched vs the reported total**, never by unique-after-dedup —
+   the latter falsely flags every healthy run as partial.
+
+7. **The CLI hides partial downloads; pacing avoids them.** `shodan download`
+   exits 0 even when it saved 5% of the results, and hammering the API with
+   back-to-back downloads triggers throttling that truncates them. The Python
+   collector paces at ~1 req/sec and retries individual failed pages instead.
 
 ---
 
