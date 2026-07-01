@@ -14,6 +14,9 @@ __pycache__/
 reports/
 # Refreshable public enrichment caches (KEV/EPSS) — not worth versioning.
 reference/
+# Derived analytical store (Parquet + DuckDB) — rebuildable from daily_downloads,
+# and contains the same sensitive named-org data. Never commit.
+store/
 
 # Logs
 *.log
