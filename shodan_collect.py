@@ -126,7 +126,13 @@ def collect_query(api, query, out, seen, page_pause, retries, backoff):
         raw += len(matches)
         saved += _write_matches(matches, out, seen)
         page += 1
-        time.sleep(page_pause)         # deliberate pacing to dodge throttling
+        # Shodan keeps a SERVER-SIDE cursor for deep pagination that expires if you
+        # page too slowly — a per-page pause caused it to time out around page ~100
+        # ("Search cursor timed out. Restart from page 1"), capping big days at
+        # 10k. Default page_pause is 0 (paginate at API speed, like the CLI). Only
+        # set it >0 if you see throttling, and expect it to break very deep pulls.
+        if page_pause:
+            time.sleep(page_pause)
 
     return saved, raw, total, last_good
 
@@ -161,7 +167,7 @@ def main():
     out_subdir = os.environ.get("OUTPUT_DIR", "daily_downloads")
     min_pct = int(os.environ.get("MIN_COMPLETENESS_PCT", "90"))
     retries = int(os.environ.get("MAX_DOWNLOAD_ATTEMPTS", "3"))
-    page_pause = float(os.environ.get("PAGE_PAUSE_SECONDS", "1.0"))
+    page_pause = float(os.environ.get("PAGE_PAUSE_SECONDS", "0"))
     backoff = float(os.environ.get("RETRY_SLEEP", "30"))
 
     # Date + window. Shodan after:/before: REQUIRE DD/MM/YYYY (ISO returns ~0).
