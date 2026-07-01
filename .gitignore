@@ -10,6 +10,11 @@ venv/
 __pycache__/
 *.pyc
 
+# Generated triage reports — list named orgs and their weaknesses (FOUO).
+reports/
+# Refreshable public enrichment caches (KEV/EPSS) — not worth versioning.
+reference/
+
 # Logs
 *.log
 
