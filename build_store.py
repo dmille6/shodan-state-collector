@@ -51,40 +51,49 @@ def date_from_name(path):
     return base.replace(".json.gz", "").split("events-")[-1]
 
 
-def parse_file(path, kev, epss):
-    """Return (observation_rows, vuln_rows) for one daily .gz."""
-    date = date_from_name(path)
-    banners = []
-    hosts = {}   # per-IP aggregate, for tier classification
+def iter_banners(path):
+    """Stream one banner (parsed JSON) at a time from a daily .gz — bounded memory
+    even when a day decompresses to many GB (full HTTP bodies can be 10-15 MB each)."""
     with gzip.open(path, "rt") as fh:
         for line in fh:
             try:
                 r = json.loads(line)
             except Exception:
                 continue
-            ip = r.get("ip_str")
-            if not ip:
-                continue
-            banners.append(r)
-            h = hosts.setdefault(ip, {"org": None, "ports": set(),
-                                      "hostnames": set(), "domains": set()})
-            h["org"] = h["org"] or r.get("org")
-            h["ports"].add(r.get("port"))
-            h["hostnames"].update(r.get("hostnames") or [])
-            h["domains"].update(r.get("domains") or [])
+            if r.get("ip_str"):
+                yield r
 
+
+def build_day(path, kev, epss, obs_fh, vuln_fh):
+    """Two streaming passes over a daily .gz, writing flattened rows to the open
+    temp files obs_fh / vuln_fh. Never holds the full day in memory. Returns
+    (date, n_obs, n_vuln)."""
+    date = date_from_name(path)
+
+    # Pass 1: per-IP aggregate (small) to classify sector tier.
+    hosts = {}
+    for r in iter_banners(path):
+        h = hosts.setdefault(r["ip_str"], {"org": None, "ports": set(),
+                                           "hostnames": set(), "domains": set()})
+        h["org"] = h["org"] or r.get("org")
+        h["ports"].add(r.get("port"))
+        h["hostnames"].update(r.get("hostnames") or [])
+        h["domains"].update(r.get("domains") or [])
     tier_of = {}
     for ip, h in hosts.items():
         h["hostnames"] = sorted(h["hostnames"])
         h["domains"] = sorted(h["domains"])
         tier_of[ip], _ = tr.classify(h)
 
-    obs, vulns = [], []
-    for r in banners:
-        ip = r.get("ip_str")
+    # Pass 2: stream banners → write obs + vuln rows straight to temp files.
+    # We keep ONLY the exposure-relevant fields (never the giant http body), so
+    # the store stays tiny regardless of how large the raw banners are.
+    n_obs = n_vuln = 0
+    for r in iter_banners(path):
+        ip = r["ip_str"]
         port = r.get("port")
         loc = r.get("location") or {}
-        obs.append({
+        obs_fh.write(json.dumps({
             "date": date, "ip": ip, "port": port,
             "transport": r.get("transport"), "asn": r.get("asn"),
             "org": r.get("org"), "isp": r.get("isp"),
@@ -93,37 +102,35 @@ def parse_file(path, kev, epss):
             "hostnames": ",".join(r.get("hostnames") or []),
             "domains": ",".join(r.get("domains") or []),
             "hash": str(r.get("hash")), "tier": tier_of.get(ip),
-        })
+        }) + "\n")
+        n_obs += 1
         for cve, meta in (r.get("vulns") or {}).items():
             cvss = meta.get("cvss") if isinstance(meta, dict) else None
             try:
                 cvss = float(cvss) if cvss is not None else None
             except (TypeError, ValueError):
                 cvss = None
-            vulns.append({
+            vuln_fh.write(json.dumps({
                 "date": date, "ip": ip, "port": port, "cve": cve,
-                "cvss": cvss, "in_kev": cve in kev,
-                "epss": epss.get(cve),
-            })
-    return date, obs, vulns
+                "cvss": cvss, "in_kev": cve in kev, "epss": epss.get(cve),
+            }) + "\n")
+            n_vuln += 1
+    return date, n_obs, n_vuln
 
 
-def write_partition(con, rows, out_dir, date, select_sql):
+def copy_to_partition(con, tmp_path, n_rows, out_dir, date, select_sql):
+    """COPY an already-written temp NDJSON into that date's parquet partition."""
     part_dir = os.path.join(out_dir, f"date={date}")
     os.makedirs(part_dir, exist_ok=True)
     out_parquet = os.path.join(part_dir, "data.parquet")
-    if not rows:
-        # Write an empty-but-typed partition so views still union cleanly.
-        rows = []
-    with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False) as tmp:
-        for row in rows:
-            tmp.write(json.dumps(row) + "\n")
-        tmp_path = tmp.name
-    try:
-        con.execute(f"COPY ({select_sql.format(src=repr(tmp_path))}) "
-                    f"TO '{out_parquet}' (FORMAT PARQUET)")
-    finally:
-        os.unlink(tmp_path)
+    if n_rows == 0:
+        # No rows for this table today — drop any stale partition so the glob
+        # doesn't try to read an empty file.
+        if os.path.exists(out_parquet):
+            os.remove(out_parquet)
+        return None
+    con.execute(f"COPY ({select_sql.format(src=repr(tmp_path))}) "
+                f"TO '{out_parquet}' (FORMAT PARQUET)")
     return out_parquet
 
 
@@ -201,10 +208,17 @@ def main():
     kev, epss = load_enrichment()
     con = duckdb.connect(DB_PATH)
     for path in files:
-        date, obs, vulns = parse_file(path, kev, epss)
-        write_partition(con, obs, OBS_DIR, date, OBS_SELECT)
-        write_partition(con, vulns, VULN_DIR, date, VULN_SELECT)
-        print(f"{date}: {len(obs):,} observations, {len(vulns):,} vuln rows")
+        of = tempfile.NamedTemporaryFile("w", suffix=".obs.ndjson", delete=False)
+        vf = tempfile.NamedTemporaryFile("w", suffix=".vuln.ndjson", delete=False)
+        try:
+            date, n_obs, n_vuln = build_day(path, kev, epss, of, vf)
+            of.close(); vf.close()
+            copy_to_partition(con, of.name, n_obs, OBS_DIR, date, OBS_SELECT)
+            copy_to_partition(con, vf.name, n_vuln, VULN_DIR, date, VULN_SELECT)
+            print(f"{date}: {n_obs:,} observations, {n_vuln:,} vuln rows")
+        finally:
+            of.close(); vf.close()
+            os.unlink(of.name); os.unlink(vf.name)
     refresh_views(con)
     n_obs = con.execute("SELECT count(*) FROM observations").fetchone()[0]
     n_days = con.execute("SELECT count(DISTINCT date) FROM observations").fetchone()[0]
