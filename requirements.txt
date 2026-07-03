@@ -3,3 +3,4 @@ shodan
 # Pin below 81 so the CLI runs on Python 3.12+ (incl. 3.14) without ImportError.
 setuptools<81
 duckdb
+geoip2

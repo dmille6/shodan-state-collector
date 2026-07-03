@@ -24,3 +24,7 @@ store/
 # Any stray Shodan credential files
 *api_key*
 .config/
+
+# MaxMind GeoIP databases (licensed, large)
+*.mmdb
+geoip*.tar.gz

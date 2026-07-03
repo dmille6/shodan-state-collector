@@ -64,15 +64,19 @@ def iter_banners(path):
                 yield r
 
 
-def build_day(path, kev, epss, obs_fh, vuln_fh):
+def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
     """Two streaming passes over a daily .gz, writing flattened rows to the open
-    temp files obs_fh / vuln_fh. Never holds the full day in memory. Returns
-    (date, n_obs, n_vuln)."""
+    temp files obs_fh / vuln_fh. Never holds the full day in memory. Only records
+    passing `geokeep(banner)` enter the store — this is the geo gate that keeps
+    non-target-state pollution out of DuckDB even from already-polluted archives.
+    Returns (date, n_obs, n_vuln, n_dropped)."""
     date = date_from_name(path)
 
-    # Pass 1: per-IP aggregate (small) to classify sector tier.
+    # Pass 1: per-IP aggregate (small) to classify sector tier — geo-filtered.
     hosts = {}
     for r in iter_banners(path):
+        if not geokeep(r):
+            continue
         h = hosts.setdefault(r["ip_str"], {"org": None, "ports": set(),
                                            "hostnames": set(), "domains": set()})
         h["org"] = h["org"] or r.get("org")
@@ -88,8 +92,11 @@ def build_day(path, kev, epss, obs_fh, vuln_fh):
     # Pass 2: stream banners → write obs + vuln rows straight to temp files.
     # We keep ONLY the exposure-relevant fields (never the giant http body), so
     # the store stays tiny regardless of how large the raw banners are.
-    n_obs = n_vuln = 0
+    n_obs = n_vuln = n_dropped = 0
     for r in iter_banners(path):
+        if not geokeep(r):
+            n_dropped += 1
+            continue
         ip = r["ip_str"]
         port = r.get("port")
         loc = r.get("location") or {}
@@ -115,7 +122,7 @@ def build_day(path, kev, epss, obs_fh, vuln_fh):
                 "cvss": cvss, "in_kev": cve in kev, "epss": epss.get(cve),
             }) + "\n")
             n_vuln += 1
-    return date, n_obs, n_vuln
+    return date, n_obs, n_vuln, n_dropped
 
 
 def copy_to_partition(con, tmp_path, n_rows, out_dir, date, select_sql):
@@ -206,16 +213,42 @@ def main():
 
     os.makedirs(STORE, exist_ok=True)
     kev, epss = load_enrichment()
+
+    # Geo gate: only records that geolocate to the target state (or match a
+    # state-named org, for org-rescue) enter the store. Independent MaxMind lookup
+    # if available, else the banner's own region_code. This keeps DuckDB clean
+    # even when reprocessing an already-polluted archive (e.g. the 07-01 file).
+    state_code = os.environ.get("SHODAN_STATE_CODE", "LA")
+    state_name = (os.environ.get("SHODAN_STATE_NAME", "louisiana")).lower()
+    gate = None
+    try:
+        import geo
+        gate = geo.GeoGate(country="US", region=state_code)
+        print(f"Geo gate: MaxMind {os.path.basename(gate.db_path)}")
+    except Exception as exc:
+        print(f"Geo gate: MaxMind unavailable ({exc}); using banner region_code")
+
+    def geokeep(r):
+        if gate is not None:
+            if gate.in_target(r.get("ip_str")):
+                return True
+        else:
+            loc = r.get("location") or {}
+            if loc.get("country_code") == "US" and loc.get("region_code") == state_code:
+                return True
+        return state_name in (r.get("org") or "").lower()   # org-rescue records
+
     con = duckdb.connect(DB_PATH)
     for path in files:
         of = tempfile.NamedTemporaryFile("w", suffix=".obs.ndjson", delete=False)
         vf = tempfile.NamedTemporaryFile("w", suffix=".vuln.ndjson", delete=False)
         try:
-            date, n_obs, n_vuln = build_day(path, kev, epss, of, vf)
+            date, n_obs, n_vuln, n_drop = build_day(path, kev, epss, of, vf, geokeep)
             of.close(); vf.close()
             copy_to_partition(con, of.name, n_obs, OBS_DIR, date, OBS_SELECT)
             copy_to_partition(con, vf.name, n_vuln, VULN_DIR, date, VULN_SELECT)
-            print(f"{date}: {n_obs:,} observations, {n_vuln:,} vuln rows")
+            print(f"{date}: {n_obs:,} observations, {n_vuln:,} vuln rows"
+                  f"{f' ({n_drop:,} off-target dropped)' if n_drop else ''}")
         finally:
             of.close(); vf.close()
             os.unlink(of.name); os.unlink(vf.name)

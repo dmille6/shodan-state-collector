@@ -95,9 +95,9 @@ def search_page(api, query, page, retries, backoff):
     return None
 
 
-def collect_query(api, query, out, seen, page_pause, retries, backoff):
+def collect_query(api, query, out, seen, page_pause, retries, backoff, geokeep):
     """Paginate a query, writing unique banners to the open gzip file `out`.
-    Returns (saved_unique, raw_fetched, reported_total, complete_bool).
+    Returns (saved_unique, raw_fetched, reported_total, complete_bool, geo_dropped).
 
     Completeness is measured by RAW banners fetched vs the reported total — NOT by
     unique-after-dedup. Shodan's index returns the same banner across pages, so
@@ -105,11 +105,11 @@ def collect_query(api, query, out, seen, page_pause, retries, backoff):
     the raw total would falsely flag every healthy run as partial."""
     first = search_page(api, query, 1, retries, backoff)
     if first is None:
-        return 0, 0, 0, False
+        return 0, 0, 0, False, 0
     total = first.get("total", 0)
     first_matches = first.get("matches", [])
     raw = len(first_matches)
-    saved = _write_matches(first_matches, out, seen)
+    saved, dropped = _write_matches(first_matches, out, seen, geokeep)
     log(f"    total reported: {total}; page 1 ok")
 
     page = 2
@@ -124,7 +124,9 @@ def collect_query(api, query, out, seen, page_pause, retries, backoff):
         if not matches:
             break
         raw += len(matches)
-        saved += _write_matches(matches, out, seen)
+        w, d = _write_matches(matches, out, seen, geokeep)
+        saved += w
+        dropped += d
         page += 1
         # Shodan keeps a SERVER-SIDE cursor for deep pagination that expires if you
         # page too slowly — a per-page pause caused it to time out around page ~100
@@ -134,13 +136,19 @@ def collect_query(api, query, out, seen, page_pause, retries, backoff):
         if page_pause:
             time.sleep(page_pause)
 
-    return saved, raw, total, last_good
+    return saved, raw, total, last_good, dropped
 
 
-def _write_matches(matches, out, seen):
-    """Write banners not already seen (dedup by hash, fallback ip:port:ts)."""
-    n = 0
+def _write_matches(matches, out, seen, geokeep):
+    """Write banners not already seen (dedup by hash, fallback ip:port:ts).
+    `geokeep(banner)` must return True to keep it — records failing the geo check
+    are dropped (this is what prevents worldwide pollution from a broken filter).
+    Returns (n_written, n_geo_dropped)."""
+    written = dropped = 0
     for banner in matches:
+        if not geokeep(banner):
+            dropped += 1
+            continue
         key = banner.get("hash")
         if key is None:
             key = f"{banner.get('ip_str')}:{banner.get('port')}:{banner.get('timestamp')}"
@@ -148,8 +156,8 @@ def _write_matches(matches, out, seen):
             continue
         seen.add(key)
         out.write(json.dumps(banner) + "\n")
-        n += 1
-    return n
+        written += 1
+    return written, dropped
 
 
 def main():
@@ -193,6 +201,28 @@ def main():
     if org_rescue:
         queries.append(f"org:{org_name} -state:{state_code} {window}")
 
+    # Geo gate. NEVER trust the query's state: filter alone — it has been observed
+    # to fail and return worldwide hosts (2026-07-01: 95% non-LA). We verify each
+    # IP independently with MaxMind if available, else fall back to the banner's
+    # own region_code. The org-rescue query (index 1) is EXEMPT — it intentionally
+    # finds state-named orgs hosted out of state.
+    gate = None
+    try:
+        import geo
+        gate = geo.GeoGate(country="US", region=state_code)
+        log(f"Geo gate: MaxMind {os.path.basename(gate.db_path)} (independent per-IP check)")
+    except Exception as exc:
+        log(f"Geo gate: MaxMind unavailable ({exc}); using banner region_code fallback")
+
+    def geokeep_primary(banner):
+        if gate is not None:
+            return gate.in_target(banner.get("ip_str"))
+        loc = banner.get("location") or {}
+        return loc.get("country_code") == "US" and loc.get("region_code") == state_code
+
+    def geokeep_all(_banner):
+        return True
+
     daily_dir = os.path.join(SCRIPT_DIR, out_subdir)
     os.makedirs(daily_dir, exist_ok=True)
     out_path = os.path.join(daily_dir, f"{state_name}-events-{iso}.json.gz")
@@ -204,20 +234,31 @@ def main():
     seen = set()
     total_saved = 0
     incomplete = False
+    suspect = False
     tmp_path = out_path + ".tmp"
     with gzip.open(tmp_path, "wt", encoding="utf-8") as out:
         for i, q in enumerate(queries):
             log(f"Query[{i}]: {q}")
-            saved, raw, total, complete = collect_query(
-                api, q, out, seen, page_pause, retries, backoff)
+            geokeep = geokeep_all if i == 1 else geokeep_primary
+            saved, raw, total, complete, dropped = collect_query(
+                api, q, out, seen, page_pause, retries, backoff, geokeep)
             pct = (raw * 100 // total) if total else 100
+            drop_pct = (dropped * 100 // raw) if raw else 0
             log(f"Query[{i}]: fetched {raw} of ~{total} ({pct}%), "
-                f"{saved} unique after dedup{'' if complete else ' — a page was lost'}")
+                f"dropped {dropped} off-target ({drop_pct}%), "
+                f"{saved} unique kept{'' if complete else ' — a page was lost'}")
             total_saved += saved
             if not complete or (total and pct < min_pct):
                 incomplete = True
                 if i == 0:
                     log("  primary geo query is incomplete")
+            # A high off-target drop rate on the PRIMARY query means Shodan's
+            # state: filter misbehaved (returned worldwide hosts). The archive
+            # stays clean, but we likely under-collected the target state.
+            if i == 0 and drop_pct > 30:
+                suspect = True
+                log(f"  SUSPECT: {drop_pct}% of primary results were NOT {state_code} "
+                    f"— query filter likely failed; day is clean but probably incomplete.")
 
     if total_saved <= 0:
         os.remove(tmp_path)
@@ -229,6 +270,10 @@ def main():
     size = os.path.getsize(out_path)
     log(f"Wrote {total_saved} unique records to {os.path.basename(out_path)} ({size} bytes)")
 
+    if suspect:
+        log(f"WARNING: collection for {iso} is SUSPECT — the state filter returned "
+            f"mostly off-target hosts. Archive is geo-clean but likely under-collected.")
+        return 4
     if incomplete:
         log(f"WARNING: collection for {iso} is PARTIAL "
             f"(below {min_pct}% or a page was lost). Data kept; flagging for review.")
