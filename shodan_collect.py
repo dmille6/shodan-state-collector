@@ -27,6 +27,7 @@ Exit codes: 0 ok, 1 setup/primary-query failure, 2 zero records, 3 partial.
 """
 import argparse
 import gzip
+import ipaddress
 import json
 import os
 import sys
@@ -160,12 +161,76 @@ def _write_matches(matches, out, seen, geokeep):
     return written, dropped
 
 
+def count_query(api, query, retries, backoff):
+    """Free result count for a query, with retry. Returns -1 if it can't be sized."""
+    delay = backoff
+    for attempt in range(1, retries + 1):
+        try:
+            return api.count(query).get("total", 0)
+        except shodan.APIError as exc:
+            if attempt == retries:
+                log(f"    count failed after {retries} attempts ({exc})")
+                return -1
+            time.sleep(min(delay, 30))
+            delay *= 2
+    return -1
+
+
+def collect_sharded(api, base_query, out, seen, page_pause, retries, backoff,
+                    geokeep, threshold):
+    """Collect base_query by recursively bisecting the IP-address space with net:
+    filters, so every shard pulled stays under `threshold` results and paginates
+    shallowly (avoiding the deep-cursor timeout entirely).
+
+    Provably complete: the leaf ranges partition all of IPv4 + IPv6 global-unicast
+    space, so every host falls in exactly one leaf — there is no ASN list or facet
+    cap to be incomplete. Empty ranges cost one (free) count and are pruned.
+    Returns (saved_unique, raw_fetched, geo_dropped, incomplete, n_leaf_shards)."""
+    saved = raw = dropped = shards = 0
+    incomplete = False
+    # Seeds: IPv4 as two halves (net:0.0.0.0/0 is not reliably accepted) + IPv6.
+    stack = ["0.0.0.0/1", "128.0.0.0/1", "2000::/3"]
+    MAX_SHARDS = 5000  # runaway backstop; a real day is tens of shards
+    while stack:
+        if shards >= MAX_SHARDS:
+            log("  ERROR: shard cap hit — aborting shard walk (result incomplete)")
+            incomplete = True
+            break
+        cidr = stack.pop()
+        cnt = count_query(api, f"{base_query} net:{cidr}", retries, backoff)
+        if cnt == 0:
+            continue                      # empty range — prune
+        if cnt < 0:
+            incomplete = True             # couldn't size it; don't silently skip
+            continue
+        net = ipaddress.ip_network(cidr, strict=False)
+        maxlen = 32 if net.version == 4 else 128
+        if cnt > threshold and net.prefixlen < maxlen:
+            stack.extend(str(c) for c in net.subnets(prefixlen_diff=1))
+            continue                      # too big — split and recurse
+        # Leaf: small enough (or un-splittable) — pull it with shallow pagination.
+        s, r, _tot, complete, d = collect_query(
+            api, f"{base_query} net:{cidr}", out, seen, page_pause, retries, backoff, geokeep)
+        saved += s
+        raw += r
+        dropped += d
+        shards += 1
+        if not complete:
+            incomplete = True
+    log(f"  sharded: {shards} leaf shards; {raw} fetched, {saved} unique kept, "
+        f"{dropped} off-target dropped")
+    return saved, raw, dropped, incomplete, shards
+
+
 def main():
     load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
     ap = argparse.ArgumentParser(description="Collect a state's Shodan host delta.")
     ap.add_argument("--date", help="collection date YYYY-MM-DD (default: today). "
                                     "Use to backfill a specific day.")
+    ap.add_argument("--shard", action="store_true",
+                    help="collect the primary query via CIDR-bisection sharding "
+                         "(robust against deep-cursor timeouts on big days)")
     args = ap.parse_args()
 
     state_code = os.environ.get("SHODAN_STATE_CODE", "LA")
@@ -177,6 +242,9 @@ def main():
     retries = int(os.environ.get("MAX_DOWNLOAD_ATTEMPTS", "3"))
     page_pause = float(os.environ.get("PAGE_PAUSE_SECONDS", "0"))
     backoff = float(os.environ.get("RETRY_SLEEP", "30"))
+    shard_threshold = int(os.environ.get("SHARD_THRESHOLD", "4000"))
+    shard_mode = args.shard or os.environ.get("SHARD_MODE", "off").lower() in (
+        "on", "true", "cidr", "1")
 
     # Date + window. Shodan after:/before: REQUIRE DD/MM/YYYY (ISO returns ~0).
     if args.date:
@@ -239,10 +307,19 @@ def main():
     tmp_path = out_path + ".tmp"
     with gzip.open(tmp_path, "wt", encoding="utf-8") as out:
         for i, q in enumerate(queries):
-            log(f"Query[{i}]: {q}")
+            log(f"Query[{i}]: {q}{' [sharded]' if (shard_mode and i == 0) else ''}")
             geokeep = geokeep_all if i == 1 else geokeep_primary
-            saved, raw, total, complete, dropped = collect_query(
-                api, q, out, seen, page_pause, retries, backoff, geokeep)
+            if shard_mode and i == 0:
+                # Size the whole query once (free) as the completeness reference,
+                # then collect it via CIDR bisection.
+                total = count_query(api, q, retries, backoff)
+                saved, raw, dropped, sh_incomplete, n_shards = collect_sharded(
+                    api, q, out, seen, page_pause, retries, backoff, geokeep,
+                    shard_threshold)
+                complete = not sh_incomplete
+            else:
+                saved, raw, total, complete, dropped = collect_query(
+                    api, q, out, seen, page_pause, retries, backoff, geokeep)
             pct = (raw * 100 // total) if total else 100
             drop_pct = (dropped * 100 // raw) if raw else 0
             log(f"Query[{i}]: fetched {raw} of ~{total} ({pct}%), "
