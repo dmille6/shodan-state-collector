@@ -215,9 +215,10 @@ def main():
         log(f"Geo gate: MaxMind unavailable ({exc}); using banner region_code fallback")
 
     def geokeep_primary(banner):
-        if gate is not None:
-            return gate.in_target(banner.get("ip_str"))
         loc = banner.get("location") or {}
+        if gate is not None:
+            return gate.keep(banner.get("ip_str"),
+                             loc.get("country_code"), loc.get("region_code"))
         return loc.get("country_code") == "US" and loc.get("region_code") == state_code
 
     def geokeep_all(_banner):

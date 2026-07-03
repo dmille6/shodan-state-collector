@@ -229,13 +229,12 @@ def main():
         print(f"Geo gate: MaxMind unavailable ({exc}); using banner region_code")
 
     def geokeep(r):
+        loc = r.get("location") or {}
         if gate is not None:
-            if gate.in_target(r.get("ip_str")):
+            if gate.keep(r.get("ip_str"), loc.get("country_code"), loc.get("region_code")):
                 return True
-        else:
-            loc = r.get("location") or {}
-            if loc.get("country_code") == "US" and loc.get("region_code") == state_code:
-                return True
+        elif loc.get("country_code") == "US" and loc.get("region_code") == state_code:
+            return True
         return state_name in (r.get("org") or "").lower()   # org-rescue records
 
     con = duckdb.connect(DB_PATH)

@@ -59,6 +59,25 @@ class GeoGate:
         cc, sub = self.locate(ip)
         return cc == self.country and sub == self.region
 
+    def keep(self, ip, shodan_country=None, shodan_region=None):
+        """Robust keep decision: drop only on POSITIVE off-target evidence.
+
+        - MaxMind confirms target state           -> keep
+        - MaxMind confidently elsewhere (foreign,
+          or a *different* US state)               -> drop
+        - MaxMind ambiguous (IP unknown, or US with
+          no subdivision — common in GeoLite2)     -> defer to Shodan's own fields
+
+        This removes worldwide/other-state pollution WITHOUT discarding real
+        target-state hosts that the free DB can't pin to a subdivision."""
+        cc, sub = self.locate(ip)
+        if cc == self.country and sub == self.region:
+            return True
+        if cc is not None and (cc != self.country or (sub is not None and sub != self.region)):
+            return False
+        # Ambiguous — trust what Shodan reported for this banner.
+        return shodan_country == self.country and shodan_region == self.region
+
     def close(self):
         self.reader.close()
 

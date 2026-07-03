@@ -11,7 +11,10 @@ import gzip
 import io
 import json
 import os
+import subprocess
 import sys
+import tarfile
+import tempfile
 import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,13 +54,58 @@ def refresh_epss():
     print("EPSS refresh failed (all sources)")
 
 
+def load_env():
+    """Read MAXMIND_* creds from .env (gitignored) into os.environ."""
+    path = os.path.join(SCRIPT_DIR, ".env")
+    if not os.path.isfile(path):
+        return
+    for raw in open(path):
+        line = raw.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def refresh_geoip():
+    """Update the MaxMind GeoLite2-City DB (state-level geolocation). Uses curl to
+    handle the auth redirect cleanly; skips gracefully without creds."""
+    acct, key = os.environ.get("MAXMIND_ACCOUNT_ID"), os.environ.get("MAXMIND_LICENSE_KEY")
+    if not (acct and key):
+        print("GeoIP: no MaxMind creds in .env; skipping")
+        return
+    url = "https://download.maxmind.com/geoip/databases/GeoLite2-City/download?suffix=tar.gz"
+    tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False).name
+    try:
+        rc = subprocess.run(["curl", "-sL", "-u", f"{acct}:{key}", url, "-o", tmp],
+                            timeout=180).returncode
+        if rc != 0:
+            print(f"GeoIP: download failed (curl rc={rc})")
+            return
+        with tarfile.open(tmp) as tar:
+            for m in tar.getmembers():
+                if m.name.endswith(".mmdb"):
+                    m.name = os.path.basename(m.name)
+                    tar.extract(m, REF, filter="data")
+                    print(f"GeoIP: updated {m.name}")
+                    return
+        print("GeoIP: no .mmdb found in archive")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def main():
     os.makedirs(REF, exist_ok=True)
+    load_env()
     try:
         refresh_kev()
     except Exception as e:
         print(f"KEV refresh failed: {e}")
     refresh_epss()
+    try:
+        refresh_geoip()
+    except Exception as e:
+        print(f"GeoIP refresh failed: {e}")
     return 0
 
 
