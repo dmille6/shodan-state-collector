@@ -60,23 +60,19 @@ class GeoGate:
         return cc == self.country and sub == self.region
 
     def keep(self, ip, shodan_country=None, shodan_region=None):
-        """Robust keep decision: drop only on POSITIVE off-target evidence.
+        """UNION membership: keep if EITHER MaxMind or Shodan places the host in
+        the target state; drop only when BOTH agree it's off-target.
 
-        - MaxMind confirms target state           -> keep
-        - MaxMind confidently elsewhere (foreign,
-          or a *different* US state)               -> drop
-        - MaxMind ambiguous (IP unknown, or US with
-          no subdivision — common in GeoLite2)     -> defer to Shodan's own fields
-
-        This removes worldwide/other-state pollution WITHOUT discarding real
-        target-state hosts that the free DB can't pin to a subdivision."""
+        Rationale: the free GeoLite2 DB disagrees with Shodan on ~17% of hosts
+        (calling them a neighboring state), and we can't know per-host who is
+        right. For a unit that must not MISS Louisiana assets, a false negative
+        (dropping a real LA host) is worse than including a borderline one. The
+        worldwide pollution is still removed because there BOTH sources agree the
+        host is off-target (the polluted banners carried non-LA region_codes)."""
         cc, sub = self.locate(ip)
-        if cc == self.country and sub == self.region:
-            return True
-        if cc is not None and (cc != self.country or (sub is not None and sub != self.region)):
-            return False
-        # Ambiguous — trust what Shodan reported for this banner.
-        return shodan_country == self.country and shodan_region == self.region
+        maxmind_target = (cc == self.country and sub == self.region)
+        shodan_target = (shodan_country == self.country and shodan_region == self.region)
+        return maxmind_target or shodan_target
 
     def close(self):
         self.reader.close()
