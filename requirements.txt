@@ -4,3 +4,4 @@ shodan
 setuptools<81
 duckdb
 geoip2
+reportlab
