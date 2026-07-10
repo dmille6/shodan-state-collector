@@ -108,6 +108,12 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             # cpe23 (structured product id) recovers identity for hosts with no
             # free-text product; fall back to legacy cpe when cpe23 is absent.
             "cpe23": ",".join(r.get("cpe23") or r.get("cpe") or []),
+            # service = the Shodan scan module that answered (snmp, rtsp, sip, ssh,
+            # ike/l2tp/openvpn VPNs, siemens_s7 ICS, …). Present on ~100% of hosts,
+            # so it recovers a SERVICE CLASS for the ~half with no product/cpe.
+            # `info` is a sparse free-text service hint when Shodan supplies one.
+            "service": (r.get("_shodan") or {}).get("module"),
+            "info": r.get("info"),
             "city": loc.get("city"), "region_code": loc.get("region_code"),
             "hostnames": ",".join(r.get("hostnames") or []),
             "domains": ",".join(r.get("domains") or []),
@@ -152,7 +158,7 @@ def copy_to_partition(con, tmp_path, n_rows, out_dir, date, select_sql):
 OBS_SELECT = """
 SELECT CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport,
        CAST(asn AS VARCHAR) AS asn, org, isp, product, CAST(version AS VARCHAR) AS version,
-       cpe23, city, region_code, hostnames, domains, tags,
+       cpe23, service, info, city, region_code, hostnames, domains, tags,
        CAST(banner_ts AS TIMESTAMP) AS banner_ts, hash, tier
 FROM read_json_auto({src}, format='newline_delimited', maximum_object_size=100000000)
 """
