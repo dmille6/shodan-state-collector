@@ -91,6 +91,40 @@ To collect a different state, edit `.env` (`SHODAN_STATE_CODE`,
 `SHODAN_STATE_NAME`, and the org-rescue settings). Every option is documented
 inline in `.env.example`.
 
+## Compromise tripwire (`compromise_watch.py`)
+
+The collector above pulls the whole **exposure census** — every exposed host,
+most of them merely reachable or version-vulnerable. `compromise_watch.py` is the
+complement: it asks Shodan specifically for hosts it has **flagged as compromised
+/ malicious** in the target state, using Shodan's own threat tags and categories
+(`tag:compromised`, `tag:malware`, `tag:c2`, `tag:botnet`, `category:malware` —
+configurable in `.env`).
+
+For a single state this is normally a near-empty set (0–2 hosts/day), which is the
+point: a tripwire that stays silent and alerts on a genuinely bad host. Each hit is
+a **confirmed Shodan threat flag**, far higher-signal than a version-inferred CVE.
+
+```bash
+./venv/bin/python compromise_watch.py            # check today
+./venv/bin/python compromise_watch.py --dry-run  # free counts only, zero credits
+```
+
+Cost-safe: every selector is sized first with a **free** `shodan count`; a paid
+`search` runs only when the count is > 0. On a hit it archives the full banners to
+`compromise_hits/<state>-compromise-<date>.json.gz` and writes a `.txt` alert beside
+it.
+
+**New vs ongoing.** Shodan's threat tags persist on a cached scan, so the same host
+can keep matching for days without any fresh observation. A ledger
+(`compromise_hits/seen_ledger.json`) records every flagged host and its first-seen
+date, so each run separates **NEW** hosts from **ONGOING** ones. Only a genuinely new
+host prints the loud `ALERT` block and exits `10`; ongoing hosts are archived and
+noted in one quiet line (exit `0`) — the recurring-alert fatigue is gone. Hosts that
+stop matching are reported as `CLEARED`, and stale banners are annotated with how
+long ago Shodan last scanned. Exit codes: `0` clean or ongoing-only, `10` **new**
+hit(s). It runs nightly from `run_nightly.sh` after the census (without affecting the
+collector's own exit status).
+
 ## Daily cron (runs as the owning user, e.g. mike)
 
 ```cron

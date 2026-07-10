@@ -12,6 +12,9 @@ __pycache__/
 
 # Generated triage reports — list named orgs and their weaknesses (FOUO).
 reports/
+# Compromise tripwire hits — named orgs flagged by Shodan as compromised (FOUO),
+# same sensitivity as daily_downloads. Never commit; back up out-of-band.
+compromise_hits/
 # Refreshable public enrichment caches (KEV/EPSS) — not worth versioning.
 reference/
 # Derived analytical store (Parquet + DuckDB) — rebuildable from daily_downloads,

@@ -54,6 +54,21 @@ RESI_ORG_KW = ["cox", "charter", "spectrum", "comcast", "at&t", "att internet",
                "volt broadband", "uniti", "catcomm", "vexus", "allo"]
 RESI_HOST_RE = ("dhcp", "dyn", "cpe.", "res.", "client.", "pool", "broadband",
                 "biz.rr", ".rr.com", "hsd1", "static.", "customer")
+# Transit / CDN / cloud / hosting providers. Like the consumer ISPs above, the
+# `org` field here names the NETWORK OPERATOR, not the end customer — so its text
+# must NOT drive gov/edu/critical keyword matching (that mis-tiered customers,
+# e.g. an "AT&T Enterprises" host landing in 'education'). Kept deliberately
+# specific/multi-word to avoid substring false positives on real business names.
+TRANSIT_HOST_KW = ["level 3", "level3", "cogent", "hurricane electric", "he.net",
+                   "zayo", "gtt communications", "tata communications",
+                   "ntt america", "windstream", "frontier communications",
+                   "consolidated communications", "amazon", "aws", "google llc",
+                   "google cloud", "microsoft corporation", "azure", "cloudflare",
+                   "akamai", "fastly", "digitalocean", "linode", "ovh", "hetzner",
+                   "vultr", "hostgator", "bluehost", "godaddy", "unified layer",
+                   "namecheap", "leaseweb", "immense networks", "psychz", "quadranet"]
+# Any org name that describes a bulk network rather than a specific customer.
+BULK_NETWORK_KW = RESI_ORG_KW + TRANSIT_HOST_KW
 PARISHES = ["acadia", "allen", "ascension", "assumption", "avoyelles", "beauregard",
             "bienville", "bossier", "caddo", "calcasieu", "caldwell", "cameron",
             "catahoula", "claiborne", "concordia", "desoto", "east baton rouge",
@@ -79,46 +94,65 @@ def load_json(path, default):
 
 
 def classify(host):
-    """Consequence-ordered cascade. Returns (tier, reason)."""
-    text = " ".join(filter(None, [
-        (host["org"] or ""),
+    """Consequence-ordered cascade. Returns (tier, reason).
+
+    Attribution rule: the customer's OWN identity (hostnames + domains) is the
+    trusted signal. The `org` field is trusted for keyword matching only when it
+    is NOT a bulk network operator (consumer ISP / transit / cloud / hosting),
+    because those name the carrier, not the end customer — matching keywords in
+    them produced false tiers. Authoritative domain suffixes (.gov/.edu/...) are
+    always honoured regardless of the network."""
+    org_text = (host["org"] or "").lower()
+    identity_text = " ".join(filter(None, [
         " ".join(host["hostnames"]),
         " ".join(host["domains"]),
     ])).lower()
     ports = host["ports"]
+
+    bulk_network = any(kw in org_text for kw in BULK_NETWORK_KW)
+    consumer_isp = any(kw in org_text for kw in RESI_ORG_KW)
+    # Keyword search space: customer identity always; org text only when the org
+    # is a specific customer (not a bulk network).
+    kw_text = identity_text if bulk_network else (identity_text + " " + org_text)
+    via = " (via customer domain)" if bulk_network else ""
 
     # 1. Critical infrastructure — ICS ports are a hard signal; then keywords.
     ics = [name for p, name in ICS_PORTS.items() if p in ports]
     if ics:
         return "critical_infrastructure", f"ICS protocol exposed: {', '.join(ics)}"
     for kw in CRIT_KW:
-        if kw in text:
-            return "critical_infrastructure", f"keyword '{kw}'"
+        if kw in kw_text:
+            return "critical_infrastructure", f"keyword '{kw}'{via}"
 
-    # 2. Government (state/local)
+    # 2. Government (state/local) — authoritative domains first, then keywords.
     if any(d.endswith(".gov") or d.endswith(".state.la.us") for d in host["domains"]):
         return "government", "gov domain"
     for kw in GOV_KW:
-        if kw in text:
-            return "government", f"keyword '{kw}'"
+        if kw in kw_text:
+            return "government", f"keyword '{kw}'{via}"
     for par in PARISHES:
-        if par in text:
-            return "government", f"parish '{par}'"
+        if par in kw_text:
+            return "government", f"parish '{par}'{via}"
 
     # 3. Education
     if any(d.endswith(".edu") or d.endswith(".k12.la.us") for d in host["domains"]):
         return "education", "edu domain"
     for kw in EDU_KW:
-        if kw in text:
-            return "education", f"keyword '{kw}'"
+        if kw in kw_text:
+            return "education", f"keyword '{kw}'{via}"
 
-    # 4/5. Residential vs small business (best-effort; consumer ISP + dynamic rDNS)
-    on_consumer_isp = any(kw in text for kw in RESI_ORG_KW)
-    looks_dynamic = any(pat in text for pat in RESI_HOST_RE)
-    if on_consumer_isp and (looks_dynamic or not host["hostnames"]):
+    # 4/5. Residential vs small business vs unattributable.
+    looks_dynamic = any(pat in identity_text for pat in RESI_HOST_RE)
+    has_identity = bool(host["hostnames"] or host["domains"])
+    # A consumer-broadband IP with dynamic rDNS or no customer identity: residential.
+    if consumer_isp and (looks_dynamic or not has_identity):
         return "residential", "consumer ISP / dynamic rDNS"
-    if text.strip():
+    # A real customer identity, or a non-bulk org name: a specific (small) business.
+    if identity_text.strip() or (org_text.strip() and not bulk_network):
         return "small_business", "commercial org, not gov/edu/infra"
+    # Only a bulk-network name and nothing else — we cannot attribute the customer.
+    if org_text.strip():
+        return "unclassified", "bulk network address space, no customer identity"
     return "unclassified", "no attribution signal"
 
 

@@ -35,4 +35,18 @@ if ls "$DIR"/daily_downloads/*-events-"$TODAY".json.gz >/dev/null 2>&1; then
     "$PY" "$DIR/build_store.py" --date "$TODAY"
 fi
 
+# Compromise tripwire: ask Shodan for hosts it has FLAGGED as compromised/malicious
+# in this state (its own threat tags/categories), separate from the exposure census
+# above. It keeps a ledger of already-seen hosts, so exit 10 (the loud ALERT block)
+# fires only on a genuinely NEW flagged host; hosts Shodan has been flagging for days
+# are archived and noted quietly (exit 0) to avoid nightly alert fatigue. It does not
+# change this script's exit status (which stays the COLLECTOR's, so census monitoring
+# is unaffected) — a new hit is surfaced via the ALERT block in this log and
+# compromise_hits/.
+"$PY" "$DIR/compromise_watch.py"
+watch_rc=$?
+if [ "$watch_rc" -eq 10 ]; then
+    echo "$(ts) - run_nightly: COMPROMISE TRIPWIRE FIRED — see the ALERT block above and $DIR/compromise_hits/" >&2
+fi
+
 exit "$collect_rc"
