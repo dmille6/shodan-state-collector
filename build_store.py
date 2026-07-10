@@ -105,9 +105,17 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             "transport": r.get("transport"), "asn": r.get("asn"),
             "org": r.get("org"), "isp": r.get("isp"),
             "product": r.get("product"), "version": r.get("version"),
+            # cpe23 (structured product id) recovers identity for hosts with no
+            # free-text product; fall back to legacy cpe when cpe23 is absent.
+            "cpe23": ",".join(r.get("cpe23") or r.get("cpe") or []),
             "city": loc.get("city"), "region_code": loc.get("region_code"),
             "hostnames": ",".join(r.get("hostnames") or []),
             "domains": ",".join(r.get("domains") or []),
+            # Shodan's curated tags (ics, eol-product, self-signed, vpn, honeypot…).
+            "tags": ",".join(r.get("tags") or []),
+            # The banner's OWN scan time, distinct from the collection `date` — lets
+            # us tell a fresh observation from a re-served cached banner.
+            "banner_ts": r.get("timestamp"),
             "hash": str(r.get("hash")), "tier": tier_of.get(ip),
         }) + "\n")
         n_obs += 1
@@ -144,7 +152,8 @@ def copy_to_partition(con, tmp_path, n_rows, out_dir, date, select_sql):
 OBS_SELECT = """
 SELECT CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport,
        CAST(asn AS VARCHAR) AS asn, org, isp, product, CAST(version AS VARCHAR) AS version,
-       city, region_code, hostnames, domains, hash, tier
+       cpe23, city, region_code, hostnames, domains, tags,
+       CAST(banner_ts AS TIMESTAMP) AS banner_ts, hash, tier
 FROM read_json_auto({src}, format='newline_delimited', maximum_object_size=100000000)
 """
 VULN_SELECT = """
