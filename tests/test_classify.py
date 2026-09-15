@@ -424,3 +424,33 @@ def test_report_keeps_the_review_flag_visible(tmp_path):
     text = out.read_text()
     assert "mega-port" in text and "203.0.113.5" in text and "⚠" in text
     assert "| government | 1 |" in text
+
+
+# --- fifth-pass cases (from the fourth Codex review) --------------------------
+
+def test_carrier_rdns_label_does_not_set_sector_or_government():
+    assert tier(org="Cox Communications", hostnames=["cpe-health.cox.net"], domains=["cox.net"],
+                ports=[443]) == "residential"
+    assert tier(org="Cox Communications", hostnames=["cpe-police.cox.net"], domains=["cox.net"],
+                ports=[443]) == "residential"
+
+
+def test_mixed_jurisdiction_is_flagged_and_foreign_names_do_not_set_sector():
+    t, reason = classify(host(org="Conterra", hostnames=["vpn.lsu.edu", "health.pa.gov"], ports=[443]))
+    assert t == "education" and "mixed jurisdiction" in reason and "health.pa.gov" in reason
+
+
+def test_zero_score_flagged_host_appears_in_review_queue(tmp_path):
+    import gzip, json, subprocess, sys, os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    gz = tmp_path / "louisiana-events-2026-01-01.json.gz"
+    with gzip.open(gz, "wt") as f:
+        for port in list(range(10000, 10101)) + [443]:      # no CVEs, no admin/db ports: score 0
+            f.write(json.dumps({"ip_str": "203.0.113.7", "port": port, "org": "Ochsner Clinic Foundation",
+                                "hostnames": [], "domains": [], "tags": [], "vulns": {}}) + "\n")
+    out = tmp_path / "report.md"
+    r = subprocess.run([sys.executable, os.path.join(root, "triage_report.py"), str(gz), "--out", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    text = out.read_text()
+    assert "Review queue" in text and "203.0.113.7" in text and "mega-port" in text

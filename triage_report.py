@@ -289,13 +289,21 @@ def classify(host):
     org_text = (host.get("org") or "").lower()
     hostnames = [h.lower().rstrip(".") for h in (host.get("hostnames") or [])]
     domains = [d.lower().rstrip(".") for d in (host.get("domains") or [])]
-    # Names are joined with " | " — not a phrase separator — so a keyword
-    # phrase ("city of") or a parish-plus-civic pairing can never be assembled
-    # out of two unrelated names.
-    identity_text = " | ".join(hostnames + domains)
     ports = host.get("ports") or set()
     tags = {t.lower() for t in (host.get("tags") or [])}
     names = hostnames + domains          # authority is checked on both
+
+    # Carrier rDNS ("cpe-health.cox.net") is the carrier's label for the line,
+    # not the customer's identity: it must not feed sector or civic keywords.
+    carrier_names = [h for h in hostnames
+                     if any(_is_or_under(h, c) for c in CARRIER_DOMAINS)
+                     and any(pat in h for pat in RESI_HOST_RE)]
+    customer_names = [h for h in hostnames if h not in carrier_names]
+    customer_domains = [d for d in domains if not any(_is_or_under(d, c) for c in CARRIER_DOMAINS)]
+    # Names are joined with " | " — not a phrase separator — so a keyword
+    # phrase ("city of") or a parish-plus-civic pairing can never be assembled
+    # out of two unrelated names.
+    identity_text = " | ".join(customer_names + customer_domains)
 
     bulk_network = first_kw(BULK_NETWORK_KW, org_text) is not None
     transit = first_kw(TRANSIT_HOST_KW, org_text) is not None
@@ -319,6 +327,16 @@ def classify(host):
     authoritative_la = "la" in kinds or la_edu or any(is_k12_la(n) for n in names)
     if "other_state" in kinds and not authoritative_la and not kw_in("louisiana", kw_text):
         return "out_of_state_gov", "another state's gov domain"
+    # Mixed evidence (a Louisiana name AND another state's name on one IP) stays
+    # in scope but is flagged, and the other-state names are removed from the
+    # keyword evidence so Pennsylvania's "health" cannot set our sector.
+    conflict = ""
+    if "other_state" in kinds:
+        foreign = [n for n in names if gov_domain_kind(n) == "other_state"]
+        kept = [n for n in customer_names + customer_domains if n not in foreign]
+        identity_text = " | ".join(kept)
+        kw_text = identity_text if bulk_network else (identity_text + " | " + org_text)
+        conflict = f" [mixed jurisdiction: {', '.join(foreign[:2])} — review]"
 
     # A host answering on >100 ports is a honeypot, scanner or NAT front — not
     # one device. It never gets an ICS-port promotion (finding 2/6), and if
@@ -326,7 +344,7 @@ def classify(host):
     # carries a real identity (Louisiana domain, sector or civic keyword) keeps
     # that tier with a review flag: a public NAT can front real victims.
     megaport = len(ports) > HONEYPOT_PORT_THRESHOLD
-    flag = f" [mega-port: {len(ports)} open ports — review]" if megaport else ""
+    flag = (f" [mega-port: {len(ports)} open ports — review]" if megaport else "") + conflict
 
     # 2. Critical infrastructure — ICS ports are a hard signal; then keywords.
     ics = [name for p, name in ICS_PORTS.items() if p in ports]
@@ -360,7 +378,7 @@ def classify(host):
 
     # 5. A parish name counts only beside a civic noun ("Cameron Parish",
     #    "parish of Cameron", "Cameron Sheriff"), never on its own.
-    parish_fields = names + ([] if bulk_network else [org_text])   # one field at a time
+    parish_fields = customer_names + customer_domains + ([] if bulk_network else [org_text])
     for par in PARISHES:
         for field in parish_fields:
             civic = near_civic(par, field)
@@ -372,11 +390,6 @@ def classify(host):
     #    (subscriber-shaped rDNS under a known carrier domain), or there is no
     #    identity at all. Any customer-looking hostname, or any domain that is
     #    not a known carrier domain, is customer identity -> a business.
-    carrier_names = [h for h in hostnames
-                     if any(_is_or_under(h, c) for c in CARRIER_DOMAINS)
-                     and any(pat in h for pat in RESI_HOST_RE)]
-    customer_names = [h for h in hostnames if h not in carrier_names]
-    customer_domains = [d for d in domains if not any(_is_or_under(d, c) for c in CARRIER_DOMAINS)]
     # A real customer identity, or a non-bulk org name: a specific (small)
     # business — kept as a reviewable lead even on a mega-port host.
     if customer_names or customer_domains or (org_text.strip() and not bulk_network):
@@ -454,7 +467,7 @@ def main():
         score = (len(kev_hits) * 100 + len(ics) * 40 + len(admin) * 15 +
                  len(dbs) * 25 + int(max_epss * 50))
         tiered[tier].append({
-            "ip": ip, "org": h["org"], "city": h["city"], "score": score,
+            "tier": tier, "ip": ip, "org": h["org"], "city": h["city"], "score": score,
             "kev": kev_hits, "ics": ics, "admin": admin, "dbs": dbs,
             "epss": round(max_epss, 3), "n_cves": len(h["cves"]),
             "reason": reason, "products": sorted(h["products"])[:3],
@@ -501,6 +514,18 @@ def main():
               f"{' '.join(x['ics']) or '—'} | {' '.join(x['admin']) or '—'} | "
               f"{' '.join(x['dbs']) or '—'} | {x['epss'] or '—'} | {base[:28]} | "
               f"{('⚠ ' + note.rstrip(']')) if note else '—'} |")
+        w("")
+
+    review = [x for t in TIERS for x in tiered.get(t, []) if " [" in x["reason"]]
+    if review:
+        w(f"## Review queue — {len(review):,} flagged host(s), listed regardless of score")
+        w("")
+        w("| tier | IP | org | city | flag |")
+        w("|---|---|---|---|---|")
+        for x in sorted(review, key=lambda x: (TIERS.index(x["tier"]), -x["score"])):
+            note = x["reason"].partition(" [")[2].rstrip("]")
+            w(f"| {x['tier'].replace('_', ' ')} | {x['ip']} | {(x['org'] or '')[:24]} | "
+              f"{(x['city'] or '')[:14]} | ⚠ {note} |")
         w("")
 
     report = "\n".join(lines)
