@@ -128,12 +128,63 @@ collector's own exit status).
 ## Daily cron (runs as the owning user, e.g. mike)
 
 ```cron
-30 23 * * * /opt/shodan_query/venv/bin/python /opt/shodan_query/shodan_collect.py >> /opt/shodan_query/cron.log 2>&1
+# nightly pipeline: collect -> store -> compromise tripwire
+30 23 * * * /opt/shodan_query/run_nightly.sh >> /opt/shodan_query/cron.log 2>&1
+# morning repair: re-pull any recent day that is missing or came back partial
+0 6 * * *   /opt/shodan_query/venv/bin/python /opt/shodan_query/backfill_missed.py >> /opt/shodan_query/cron.log 2>&1
+# weekly KEV/EPSS/GeoIP refresh
+0 23 * * 0  /opt/shodan_query/venv/bin/python /opt/shodan_query/refresh_reference.py >> /opt/shodan_query/cron.log 2>&1
 ```
 
-Exit codes: `0` success, `1` setup/primary-query failure, `2` zero records
-collected (suspicious — investigate), `3` partial (a page was lost or the fetch
-came back below `MIN_COMPLETENESS_PCT`; data is kept but flagged for review).
+Collector exit codes: `0` success, `1` setup/primary-query failure, `2` zero
+records collected (suspicious — investigate), `3` partial (a page was lost, the
+fetch came back below `MIN_COMPLETENESS_PCT`, or completeness could not be
+verified), `4` suspect (state filter returned mostly off-target hosts).
+
+### Noticing and repairing bad nights
+
+Three things make sure a missed or partial night does not silently become a hole
+in the archive:
+
+- **`status/<date>.rc`** — `run_nightly.sh` records the collector's exit code for
+  every day it runs.
+- **`backfill_missed.py`** (06:00) — re-pulls any day in the last
+  `BACKFILL_LOOKBACK_DAYS` whose file is missing (including one stranded in a
+  `.backup.*` copy), whose recorded exit != 0, or whose nightly run was
+  interrupted (in-progress marker `-1` left behind). A cut-off download the
+  collector left as `.tmp` is quarantined and salvaged, never overwritten. The
+  fresh pull and every existing copy of the day are **merged** into one file,
+  dropping only byte-identical duplicate records (a true superset of everything
+  readable — a second observation of the same banner with a different timestamp
+  is kept, and so are two hosts serving an identical banner); copies that
+  could not be fully read are kept for another pass and the day stays unclean,
+  copies with unparseable lines are parked as `.rejected.*`, and only fully
+  merged backups are removed. The day is then re-projected into the store.
+  Honors the same `<3GB free` guard as the nightly (plus room for the merge) and
+  falls back to restoring the best backup by rename if it cannot merge. `--dry-run`
+  reports without changing anything; `--date` forces a specific day. Exit `0` all
+  clean, `3` some inspected day is still not clean, `1` lock/setup. Backfill
+  sooner rather than later — the daily query matches a host's *latest* banner,
+  so an old day's hosts are progressively re-scanned out of the window.
+- **`HEALTHCHECK_URL`** — a dead-man's-switch (healthchecks.io style). cron can
+  report a run that failed; only an external check can report a run that never
+  happened (box powered off, cron dead). `run_nightly.sh` pings `/start`, then
+  success (exit 0 or 3) or `/fail`; the check alerts on silence.
+
+`run_nightly.sh` and `backfill_missed.py` share a lock (`.pipeline.lock`) so they
+never run concurrently. **Operational rule:** always collect through one of
+those two (or, by hand, `backfill_missed.py --date <day>`), never by running
+`shodan_collect.py` directly while the pipeline may be active — the collector
+itself takes no lock.
+
+Files you may find beside a day's archive and what they mean:
+
+| Name | Meaning |
+|---|---|
+| `<day>.json.gz.backup.<ts>` | a copy the collector moved aside, or one not yet fully merged — the morning job will merge it |
+| `<day>.json.gz.backup.<ts>.partialpull` | a cut-off download rescued from a killed run, waiting to be salvaged |
+| `<day>.json.gz.salvaged.<ts>` | a cut-off download that HAS been salvaged into the day; raw bytes kept, never re-read |
+| `<day>.json.gz.rejected.<ts>` | a copy with unparseable lines; its good records were merged, raw bytes kept, never re-read |
 
 ---
 

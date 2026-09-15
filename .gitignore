@@ -31,3 +31,7 @@ store/
 # MaxMind GeoIP databases (licensed, large)
 *.mmdb
 geoip*.tar.gz
+
+# Runtime bookkeeping (per-day collector exit codes, pipeline lock)
+status/
+.pipeline.lock

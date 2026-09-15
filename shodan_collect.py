@@ -185,8 +185,10 @@ def collect_sharded(api, base_query, out, seen, page_pause, retries, backoff,
     Provably complete: the leaf ranges partition all of IPv4 + IPv6 global-unicast
     space, so every host falls in exactly one leaf — there is no ASN list or facet
     cap to be incomplete. Empty ranges cost one (free) count and are pruned.
-    Returns (saved_unique, raw_fetched, geo_dropped, incomplete, n_leaf_shards)."""
-    saved = raw = dropped = shards = 0
+    Returns (saved_unique, raw_fetched, geo_dropped, incomplete, n_leaf_shards,
+    leaf_total) where leaf_total is the sum of the free per-leaf counts — a second,
+    independent completeness reference for when the whole-query count is bogus."""
+    saved = raw = dropped = shards = leaf_total = 0
     incomplete = False
     # Seeds: IPv4 as two halves (net:0.0.0.0/0 is not reliably accepted) + IPv6.
     stack = ["0.0.0.0/1", "128.0.0.0/1", "2000::/3"]
@@ -215,11 +217,41 @@ def collect_sharded(api, base_query, out, seen, page_pause, retries, backoff,
         raw += r
         dropped += d
         shards += 1
+        leaf_total += cnt
         if not complete:
             incomplete = True
     log(f"  sharded: {shards} leaf shards; {raw} fetched, {saved} unique kept, "
         f"{dropped} off-target dropped")
-    return saved, raw, dropped, incomplete, shards
+    return saved, raw, dropped, incomplete, shards, leaf_total
+
+
+def reference_total(global_total, raw, leaf_total):
+    """Pick a trustworthy completeness reference for a sharded run.
+
+    The whole-query `count` has come back as -1 (count call failed after retries)
+    and as an absurd 123 against ~80k fetched (Shodan returned a bogus count
+    during a cursor storm). Dividing by either produced nonsense percentages that
+    either false-passed or false-flagged the night.
+
+    The leaf shards partition the address space, so their counts sum to the same
+    population the whole-query count measures — two independent readings of one
+    number. Use the LARGER of the two that are available: a bogus-LOW reading can
+    only make a night look more complete than it is, never less, so the larger
+    one is the conservative choice. Returns (total, note) — total <= 0 means NO
+    usable reference (unverifiable)."""
+    if global_total > 0 and leaf_total > 0:
+        total = max(global_total, leaf_total)
+        if total > 2 * min(global_total, leaf_total):
+            return total, (f"  reference counts disagree (whole-query={global_total}, "
+                           f"sum of leaf shards={leaf_total}, fetched={raw}); using {total}")
+        return total, ""
+    if leaf_total > 0:
+        return leaf_total, (f"  whole-query count unavailable ({global_total}); "
+                            f"using sum of leaf-shard counts={leaf_total}")
+    if global_total > 0:
+        return global_total, ""
+    return 0, (f"  completeness UNVERIFIABLE (whole-query count={global_total}, "
+               f"no leaf counts) — flagging PARTIAL so the morning backfill re-pulls")
 
 
 def main():
@@ -297,6 +329,10 @@ def main():
     out_path = os.path.join(daily_dir, f"{state_name}-events-{iso}.json.gz")
     if os.path.exists(out_path):
         backup = f"{out_path}.backup.{int(time.time())}"
+        n = 0
+        while os.path.exists(backup):          # never overwrite an earlier backup
+            n += 1
+            backup = f"{out_path}.backup.{int(time.time())}.{n}"
         log(f"WARNING: {os.path.basename(out_path)} exists — backing up to {os.path.basename(backup)}")
         os.replace(out_path, backup)
 
@@ -305,6 +341,19 @@ def main():
     incomplete = False
     suspect = False
     tmp_path = out_path + ".tmp"
+    if os.path.exists(tmp_path):
+        # A previous run was killed mid-download. Its .tmp is a cut-off gzip that
+        # can still hold thousands of records nobody can re-pull — never truncate
+        # it. Quarantine it under a name backfill_missed.py knows how to salvage.
+        q = f"{out_path}.backup.{int(time.time())}"
+        n = 0
+        while os.path.exists(q + ".partialpull"):
+            n += 1
+            q = f"{out_path}.backup.{int(time.time())}.{n}"
+        q += ".partialpull"
+        os.replace(tmp_path, q)
+        log(f"WARNING: cut-off download {os.path.basename(tmp_path)} from an interrupted run "
+            f"quarantined as {os.path.basename(q)} (backfill_missed.py will salvage it)")
     with gzip.open(tmp_path, "wt", encoding="utf-8") as out:
         for i, q in enumerate(queries):
             log(f"Query[{i}]: {q}{' [sharded]' if (shard_mode and i == 0) else ''}")
@@ -313,14 +362,19 @@ def main():
                 # Size the whole query once (free) as the completeness reference,
                 # then collect it via CIDR bisection.
                 total = count_query(api, q, retries, backoff)
-                saved, raw, dropped, sh_incomplete, n_shards = collect_sharded(
+                saved, raw, dropped, sh_incomplete, n_shards, leaf_total = collect_sharded(
                     api, q, out, seen, page_pause, retries, backoff, geokeep,
                     shard_threshold)
                 complete = not sh_incomplete
+                total, note = reference_total(total, raw, leaf_total)
+                if note:
+                    log(note)
+                if total <= 0:
+                    complete = False      # unverifiable → treat as partial
             else:
                 saved, raw, total, complete, dropped = collect_query(
                     api, q, out, seen, page_pause, retries, backoff, geokeep)
-            pct = (raw * 100 // total) if total else 100
+            pct = (raw * 100 // total) if total > 0 else (100 if total == 0 else 0)
             drop_pct = (dropped * 100 // raw) if raw else 0
             log(f"Query[{i}]: fetched {raw} of ~{total} ({pct}%), "
                 f"dropped {dropped} off-target ({drop_pct}%), "
