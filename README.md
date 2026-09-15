@@ -125,6 +125,48 @@ long ago Shodan last scanned. Exit codes: `0` clean or ongoing-only, `10` **new*
 hit(s). It runs nightly from `run_nightly.sh` after the census (without affecting the
 collector's own exit status).
 
+## Sector tiers (`triage_report.classify`)
+
+Every host is bucketed into exactly one consequence-ordered tier by
+`triage_report.classify()`, which `build_store.py` runs for every IP when it
+projects a day into the store — so the tier drives every report and every
+notification list. It is a heuristic over `org`, hostnames, domains, ports and
+Shodan tags; the owner registry planned for Phase 2 will replace most of it.
+
+| Tier | Meaning | Strongest evidence |
+|---|---|---|
+| `honeypot` | not a device, not a victim | Shodan `honeypot` tag; or more than 100 open ports **with no attributing identity at all** |
+| `critical_infrastructure` | ICS, healthcare, utilities, energy, oil & gas, emergency | an ICS protocol answering; sector words (whole-word, or the tail of a compound like `lcmchealth.org`) |
+| `government` | Louisiana state and local government | `*.la.gov`, `*.state.la.us`, `*.la.us` (except k12), listed locality domains; then words like sheriff, police jury, city of; a parish name only beside a civic noun |
+| `education` | universities, colleges, K-12 | `*.edu`, `*.k12.la.us`; school board, university, college |
+| `out_of_state_gov` | another state's government (e.g. `pa.gov`) — not our constituency | two-letter state `.gov` / `state.xx.us` |
+| `small_business` | a specific commercial org with its own identity | non-carrier org name or customer hostnames |
+| `residential` | consumer-broadband subscriber | consumer ISP org plus dynamic-looking rDNS or no identity |
+| `unclassified` | carrier address space with no customer identity | only a bulk-network org name |
+
+Rules that matter: keyword matches are **whole-word** (`lsu` no longer matches
+`dslsubs`, `allen` no longer matches Allens Communications); an **authoritative
+domain beats every keyword**; jurisdiction is decided before sector (a `pa.gov`
+name is out of scope whatever it serves, unless a Louisiana domain or the word
+Louisiana is also present); the `org` field is ignored for keyword matching
+when it names a carrier, consumer ISP, cloud or transit provider, because it
+then names the network, not the customer. A host answering on more than 100
+ports keeps whatever tier its identity earns but carries a **mega-port review
+flag** (shown in the report's `review` column) and never gets an ICS-port
+promotion — a public NAT can front real victims, but 100 open ports is not one
+device.
+
+**Changing the classifier.** Every measured misfire is a regression test:
+
+```bash
+./venv/bin/python -m pytest tests/ -q                       # must pass
+./venv/bin/python tier_audit.py --compare /tmp/old_triage_report.py   # before/after over active hosts
+./venv/bin/python tier_audit.py --examples                 # concrete hosts per tier
+flock -n .pipeline.lock ./venv/bin/python build_store.py --all --rebuild   # re-tier the store
+```
+
+Add the misfiring host to `tests/test_classify.py` first, then fix the rule.
+
 ## Daily cron (runs as the owning user, e.g. mike)
 
 ```cron

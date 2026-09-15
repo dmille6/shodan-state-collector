@@ -78,11 +78,13 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
         if not geokeep(r):
             continue
         h = hosts.setdefault(r["ip_str"], {"org": None, "ports": set(),
-                                           "hostnames": set(), "domains": set()})
+                                           "hostnames": set(), "domains": set(),
+                                           "tags": set()})
         h["org"] = h["org"] or r.get("org")
         h["ports"].add(r.get("port"))
         h["hostnames"].update(r.get("hostnames") or [])
         h["domains"].update(r.get("domains") or [])
+        h["tags"].update(r.get("tags") or [])       # honeypot tag feeds classify()
     tier_of = {}
     for ip, h in hosts.items():
         h["hostnames"] = sorted(h["hostnames"])
