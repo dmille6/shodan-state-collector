@@ -410,6 +410,8 @@ def main():
     ap.add_argument("--marking", default="FOUO — DRAFT — LEADS TO VERIFY — NOT FOR ONWARD DISTRIBUTION")
     ap.add_argument("--verify", nargs="?", const="latest", default=None,
                     help="add the verification block from verify_hosts.py (path, or 'latest')")
+    ap.add_argument("--theme", choices=["classic", "tsec"], default="tsec",
+                    help="tsec = the unit's dark field-report look (default); classic = plain landscape letter")
     args = ap.parse_args()
 
     rows, meta = load(args.db)
@@ -429,7 +431,12 @@ def main():
         verify = load_verify(vpath)
         print(f"verification: {len(verify)} hosts from {vpath}", file=sys.stderr)
     write_csv(stem + ".csv", sections, verify)
-    write_pdf(stem + ".pdf", sections, totals, meta, args.marking, args.per_tier, residential_excluded, len(rows), verify)
+    if args.theme == "tsec":
+        from report_theme_tsec import write_pdf_tsec
+        write_pdf_tsec(stem + ".pdf", sections, totals, meta, verify, args.marking, args.per_tier,
+                       residential_excluded, len(rows), SCORE_WEIGHTS)
+    else:
+        write_pdf(stem + ".pdf", sections, totals, meta, args.marking, args.per_tier, residential_excluded, len(rows), verify)
     print(json.dumps({"pdf": stem + ".pdf", "csv": stem + ".csv", "scored": len(rows),
                       "per_tier": {t: len(v) for t, v in sections.items()}, "totals": totals}))
     return 0
