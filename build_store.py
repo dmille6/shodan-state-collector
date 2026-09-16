@@ -97,8 +97,8 @@ def registry_tier(a):
         return None
     if a.get("method") not in OWNERSHIP_METHODS:
         return None
-    if "also matches" in (a.get("evidence") or ""):
-        return None
+    if "also matches" in (a.get("evidence") or "") or (a.get("conflict") or "").strip():
+        return None                     # competing evidence: an analyst decides, not the store
     sector = (a.get("sector") or "").split("|")[0]
     return SECTOR_TIER.get(sector)
 
@@ -308,6 +308,7 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep, exploits=None, attribut
             "attr_org_name": (attr_of.get(ip) or {}).get("org_name"),
             "attr_method": (attr_of.get(ip) or {}).get("method"),
             "attr_confidence": (attr_of.get(ip) or {}).get("confidence"),
+            "attr_conflict": (attr_of.get(ip) or {}).get("conflict") or None,
             # HTTP identity + TLS certificate (owner evidence; see cert_fields)
             "http_title": http.get("title"), "http_host": http.get("host"),
             "http_server": http.get("server"),
@@ -361,7 +362,7 @@ OBS_COLUMNS = {
     "domains": "VARCHAR", "tags": "VARCHAR", "banner_ts": "VARCHAR", "hash": "VARCHAR",
     "tier": "VARCHAR", "tier_reason": "VARCHAR",
     "attr_org_id": "VARCHAR", "attr_org_name": "VARCHAR", "attr_method": "VARCHAR",
-    "attr_confidence": "VARCHAR",
+    "attr_confidence": "VARCHAR", "attr_conflict": "VARCHAR",
     "http_title": "VARCHAR", "http_host": "VARCHAR", "http_server": "VARCHAR",
     "cert_cn": "VARCHAR", "cert_org": "VARCHAR", "cert_issuer": "VARCHAR", "cert_sans": "VARCHAR",
     "cert_expired": "BOOLEAN", "cert_expires": "VARCHAR", "cert_sha256": "VARCHAR", "jarm": "VARCHAR",

@@ -133,6 +133,8 @@ def test_domain_or_cert_attribution_never_sets_the_tier():
                              "confidence": "high", "evidence": "prefix; also matches la-y"}) is None
     assert bs.registry_tier({"org_id": "x", "sector": "government", "method": "ots_cidr",
                              "confidence": "medium", "evidence": "p"}) is None
+    assert bs.registry_tier({"org_id": "x", "sector": "government", "method": "ots_cidr",
+                             "confidence": "high", "evidence": "p", "conflict": "rdns=la-a;cert=la-b"}) is None
 
 
 def test_load_attributor_reports_failure_loudly(monkeypatch, capsys):
