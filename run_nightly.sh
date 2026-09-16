@@ -108,12 +108,26 @@ watch_rc=$?
 # keys are in .env), then the leads table — AFTER the store, the tripwire and
 # Shadowserver, so new compromise evidence becomes a lead the same night. Runs
 # even when no census file arrived (external evidence still needs reconciling).
+# Downstream (store / ingest / leads) failures are pipeline failures someone
+# must see even when the collector itself succeeded: they set `degraded`, which
+# turns the final healthcheck ping into /fail with the reason.
+degraded=""
+[ "$store_rc" -eq 0 ] || degraded="$degraded store_build=$store_rc;"
 if [ -f "$DIR/ingest_shadowserver.py" ]; then
-    "$PY" "$DIR/ingest_shadowserver.py" fetch --date "$TODAY" >/dev/null 2>&1 || true
-    "$PY" "$DIR/ingest_shadowserver.py" ingest || echo "$(ts) - run_nightly: WARNING shadowserver ingest exited $?" >&2
+    "$PY" "$DIR/ingest_shadowserver.py" fetch --date "$TODAY" \
+        || echo "$(ts) - run_nightly: shadowserver fetch exited $? (no-op without keys; otherwise check the API)" >&2
+    "$PY" "$DIR/ingest_shadowserver.py" ingest
+    ss_rc=$?
+    if [ "$ss_rc" -ne 0 ]; then
+        echo "$(ts) - run_nightly: WARNING shadowserver ingest exited $ss_rc" >&2; degraded="$degraded shadowserver_ingest=$ss_rc;"
+    fi
 fi
 if [ -f "$DIR/leads.py" ] && [ "$store_rc" -eq 0 ]; then
-    "$PY" "$DIR/leads.py" refresh || echo "$(ts) - run_nightly: WARNING leads refresh exited $?" >&2
+    "$PY" "$DIR/leads.py" refresh
+    leads_rc=$?
+    if [ "$leads_rc" -ne 0 ]; then
+        echo "$(ts) - run_nightly: WARNING leads refresh exited $leads_rc" >&2; degraded="$degraded leads_refresh=$leads_rc;"
+    fi
 elif [ -f "$DIR/leads.py" ]; then
     echo "$(ts) - run_nightly: leads refresh skipped (store build failed)" >&2
 fi
@@ -131,6 +145,8 @@ if [ "$bookkeeping_broken" -eq 1 ]; then
     # Collection may have been fine, but the morning repair is blind to it — that
     # is a failure someone must look at, so it must not end green.
     hc /fail "rc=$collect_rc but status/ bookkeeping FAILED for $TODAY. ${summary}"
+elif [ -n "$degraded" ]; then
+    hc /fail "rc=$collect_rc but downstream DEGRADED for $TODAY:${degraded} ${summary}"
 else
     case "$collect_rc" in
         0) hc "" "rc=0 ok. ${summary}" ;;

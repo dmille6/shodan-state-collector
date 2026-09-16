@@ -19,10 +19,13 @@ run_step() {  # run_step <minutes> <script> [args...]
     local script="$1"; shift
     [ -f "$DIR/$script" ] || return 0
     local used=$(( ($(date +%s) - start) / 60 ))
-    if [ "$used" -ge "$WEEKLY_BUDGET_MIN" ]; then
+    local remaining=$(( WEEKLY_BUDGET_MIN - used ))
+    if [ "$remaining" -le 0 ]; then
         echo "$(ts) - run_weekly: budget exhausted (${used}m) — skipping $script" >&2; rc_all=1; return 0
     fi
-    echo "$(ts) - run_weekly: $script (limit ${mins}m)"
+    # A step never runs past the whole-run budget: clip its limit to what is left.
+    [ "$mins" -gt "$remaining" ] && mins="$remaining"
+    echo "$(ts) - run_weekly: $script (limit ${mins}m, ${remaining}m of budget left)"
     timeout --kill-after=60 "${mins}m" "$PY" "$DIR/$script" "$@"
     local rc=$?
     if [ "$rc" -ne 0 ]; then
