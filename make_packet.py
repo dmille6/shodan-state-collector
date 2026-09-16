@@ -14,21 +14,32 @@ how the owner can verify for themselves. No organisation is hard-coded.
     make_packet.py --org ... --pdf                          # + PDF (reportlab)
     make_packet.py --org ... --dry-run                      # print, write nothing
 
-Rules: by default only leads in status new/queued (and notified/acknowledged,
-marked "previously notified on <date>") are included; the selected leads must all
-attribute to ONE organisation (otherwise the packet is refused and the orgs
-listed); residential/honeypot-tier leads are refused independently of leads.py;
-the appendix lists only CURRENTLY ACTIVE services on the lead hosts whose
-attribution names the same org. Every banner-derived string (product, title,
-hostnames, org, evidence …) is escaped before it enters the markdown. The packet
-is marked DRAFT until the reviewer block is completed; a compromise claim requires
-a second reviewer. Attribution is stated as the registry recorded it; a host with
-no registry attribution is "unattributed" — the Shodan org label is shown for
-reference only and never promoted to an attribution.
+Rules
+- Only leads in status new/queued by default, plus notified/acknowledged marked
+  "previously notified on <date>"; closed statuses only with --include-closed.
+- Refused: ineligible leads, leads flagged needs_attribution_review (clear with
+  `leads.py set <id> --review-cleared`), and leads whose host's CURRENT tier in
+  latest_observed is residential/honeypot — all re-checked here, independently
+  of leads.py.
+- The selected leads must attribute to ONE organisation or the packet is refused
+  with the list. Lead rows for one ip are ordered by last_evaluated; if they
+  disagree on org the address is flagged as an attribution conflict.
+- Per lead the packet states whether the service is currently active, stale or
+  gone ("last observed <date>"); new/queued leads whose service is gone go under
+  "no longer observed — historical".
+- Appendix (cross-tenant safety): other services on an address are listed ONLY
+  when the address has whole-address ownership (attr_method ots_cidr /
+  registry_network with high confidence); otherwise only the lead services
+  themselves, with "other services on this address omitted".
+- Attribution is stated as recorded (registry method/confidence; Shodan org shown
+  as a low-confidence label; else "unattributed"). Every external string is
+  escaped at every rendering boundary. The packet is DRAFT until signed off; a
+  compromise claim requires a second reviewer.
 
 Output: reports/packets/<org-slug>_<date>.md (+ .pdf).
 """
 import argparse
+import ipaddress
 import os
 import re
 import sys
@@ -129,25 +140,54 @@ VERIFY = {
 
 _ESC_RE = re.compile(r"([\\`*_\[\]|<>#~])")
 _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_HEX_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def esc(s, limit=200):
-    """Escape untrusted banner-derived text for markdown: control chars and
-    newlines collapse to a space; markdown-active characters are backslash-escaped."""
+    """Escape untrusted text for markdown prose / table cells."""
     if s is None:
         return ""
-    t = _CTRL_RE.sub(" ", str(s))
-    t = _ESC_RE.sub(r"\\\1", t)
+    t = _ESC_RE.sub(r"\\\1", _CTRL_RE.sub(" ", str(s)))
     return t[:limit] + ("…" if len(t) > limit else "")
 
 
 def code(s, limit=200):
-    """Escape untrusted text for a backtick code span (also inside a table cell):
-    backticks would end the span, pipes would split the cell, newlines the row."""
+    """Escape untrusted text for a backtick code span (inside a table cell too)."""
     if s is None:
         return ""
     t = _CTRL_RE.sub(" ", str(s)).replace("`", "'").replace("|", "\\|")
     return t[:limit] + ("…" if len(t) > limit else "")
+
+
+def ipc(s):
+    """An address is rendered raw only when it IS an address."""
+    try:
+        return str(ipaddress.ip_address(str(s).strip()))
+    except ValueError:
+        return code(s, 60)
+
+
+def tp(s):
+    return L.norm_transport(s)
+
+
+def num(s):
+    try:
+        return str(int(s))
+    except (TypeError, ValueError):
+        return esc(s, 20)
+
+
+def dt(s):
+    return esc(str(s)[:19] if s is not None else "n/a", 19)
+
+
+def lid(s):
+    return s if isinstance(s, str) and _HEX_RE.match(s) else code(s, 16)
+
+
+def status_word(s):
+    return s if s in L.STATUSES else esc(s, 20)
 
 
 def slugify(s):
@@ -159,7 +199,7 @@ def kind_of(lead):
     if lead["evidence_type"] == "shadowserver":
         return "shadowserver_compromise" if str(lead.get("evidence_key") or "").startswith("compromise") \
             else "shadowserver_exposure"
-    return lead["evidence_type"]
+    return lead["evidence_type"] if lead["evidence_type"] in EVIDENCE_LABEL else "cred_leak"
 
 
 def org_key(lead):
@@ -169,6 +209,17 @@ def org_key(lead):
 def days_ago(d, today):
     d = L._parse_date(d)
     return None if d is None else (today - d).days
+
+
+def current_host_tiers(con, ips):
+    if not ips:
+        return {}
+    ph = ", ".join("?" * len(ips))
+    rows = L.fetch_dicts(con, f"""
+        SELECT ip, tier FROM (SELECT ip, tier, row_number() OVER (PARTITION BY ip ORDER BY date DESC,
+               banner_ts DESC NULLS LAST, observation_id DESC) AS rn FROM store.latest_observed WHERE ip IN ({ph}))
+        WHERE rn = 1""", ips)
+    return {r["ip"]: r["tier"] for r in rows}
 
 
 def select_leads(ctx, org=None, ip=None, include_closed=False):
@@ -187,20 +238,31 @@ def select_leads(ctx, org=None, ip=None, include_closed=False):
             names = sorted({r["org_name"] for r in rows})
             if len(names) > 1:
                 raise SystemExit("ERROR: --org matches several organisations; be exact:\n  " + "\n  ".join(names))
-    dropped = [r for r in rows if (r.get("tier") or "") in L.NEVER_LEAD_TIERS]
-    rows = [r for r in rows if r not in dropped]
-    if dropped:
-        L.log(f"refused {len(dropped)} residential/honeypot-tier lead(s): not a notification target")
-    if not rows:
-        raise SystemExit(f"No open leads for {org or ip!r} (statuses {', '.join(statuses or ['any'])}). "
-                         f"Run `leads.py refresh` or `leads.py list --org`.")
-    orgs = {}
+    refused = []
+    tiers = current_host_tiers(ctx.con, sorted({r["ip"] for r in rows}))
+    kept = []
     for r in rows:
+        cur = tiers.get(r["ip"])
+        if (r.get("tier") or "") in L.NEVER_LEAD_TIERS or cur in L.NEVER_LEAD_TIERS:
+            refused.append(f"{r['lead_id']} host is {cur or r.get('tier')} now — not a notification target")
+        elif not r.get("eligible", True):
+            refused.append(f"{r['lead_id']} ineligible: {r.get('eligibility_reason')}")
+        elif r.get("needs_attribution_review"):
+            refused.append(f"{r['lead_id']} needs attribution review — `leads.py set {r['lead_id']} --review-cleared`")
+        else:
+            kept.append(r)
+    for msg in refused:
+        L.log("refused " + msg)
+    if not kept:
+        raise SystemExit(f"No packet for {org or ip!r}: no eligible open lead (statuses {', '.join(statuses or ['any'])})"
+                         + (f"; {len(refused)} refused, see above" if refused else "") + ".")
+    orgs = {}
+    for r in kept:
         orgs.setdefault(org_key(r), r.get("org_name") or L.UNATTRIBUTED)
     if len(orgs) > 1:
-        raise SystemExit("ERROR: the selected leads attribute to more than one organisation — one packet per "
-                         "org:\n  " + "\n  ".join(sorted(set(orgs.values()))))
-    return rows
+        raise SystemExit("ERROR: the selected leads attribute to more than one organisation — one packet per org:\n  "
+                         + "\n  ".join(sorted(set(orgs.values()))))
+    return kept
 
 
 def gather(ctx, today, org=None, ip=None, include_closed=False):
@@ -210,17 +272,27 @@ def gather(ctx, today, org=None, ip=None, include_closed=False):
     okey = org_key(leads[0])
     ips = sorted({l["ip"] for l in leads})
     ph = ", ".join("?" * len(ips))
-    # attribution of every lead host (all leads on an ip share it)
-    ip_org = {r["ip"]: org_key(r) for r in L.fetch_dicts(con, f"SELECT ip, org_id, org_name FROM leads WHERE ip IN ({ph})", ips)}
-    wanted = ["ip", "port", "transport", "date", "status", "days_since_seen", "org", "product", "version",
-              "service", "cpe23", "http_title", "hostnames", "banner_ts", "cert_cn", "cert_org", "cert_issuer",
-              "cert_sans", "tier", "tier_reason"]
+    # Per-ip attribution from EVERY lead row on the address, ordered by last_evaluated
+    # (newest last); a disagreement is a conflict, never "the last row wins".
+    ip_orgs, whole = {}, set()
+    for r in L.fetch_dicts(con, f"SELECT ip, org_id, org_name, attr_method, attr_confidence, last_evaluated, lead_id "
+                                f"FROM leads WHERE ip IN ({ph}) ORDER BY last_evaluated, lead_id", ips):
+        ip_orgs.setdefault(r["ip"], []).append(org_key(r))
+        if (r.get("attr_method") in L.WHOLE_ADDRESS_METHODS and (r.get("attr_confidence") or "") == "high"
+                and org_key(r) == okey):
+            whole.add(r["ip"])
+    conflicts = {ip for ip, ks in ip_orgs.items() if len(set(ks)) > 1}
+    whole -= conflicts
+    wanted = ["ip", "port", "transport", "date", "status", "days_since_seen", "org", "product", "version", "service",
+              "cpe23", "http_title", "hostnames", "banner_ts", "cert_cn", "cert_org", "cert_issuer", "cert_sans", "tier"]
     services = {}
-    have = set(L.columns_of(con, "exposure_status", "store"))
-    cols = ", ".join(c if c in have else f"NULL AS {c}" for c in wanted)
-    for r in L.fetch_dicts(con, f"SELECT {cols} FROM store.exposure_status WHERE ip IN ({ph})", ips):
+    for r in L.fetch_dicts(con, f"SELECT {L._adaptive_cols(con, 'exposure_status', wanted)} FROM store.exposure_status "
+                                f"WHERE ip IN ({ph})", ips):
         services[(r["ip"], r["port"], r["transport"])] = r
-    active_same_org = {k: r for k, r in services.items() if r["status"] == "active" and ip_org.get(r["ip"]) == okey}
+    lead_keys = {(l["ip"], l["port"], l["transport"]) for l in leads}
+    appendix = {k: r for k, r in services.items()
+                if (k[0] in whole and r["status"] == "active") or (k in lead_keys)}
+    omitted = sorted(ip for ip in ips if ip not in whole)
     cves = {}
     for r in L.fetch_dicts(con, f"""
             SELECT lo.ip, lo.port, lo.transport, v.cve, v.cvss, v.epss, v.verified
@@ -229,8 +301,8 @@ def gather(ctx, today, org=None, ip=None, include_closed=False):
         cves.setdefault((r["ip"], r["port"], r["transport"]), []).append(r)
     life = {(r["ip"], r["port"], r["transport"]): r for r in
             L.fetch_dicts(con, f"SELECT * FROM store.lifecycle WHERE ip IN ({ph})", ips)}
-    return {"name": name, "leads": leads, "ips": ips, "services": services, "active_same_org": active_same_org,
-            "cves": cves, "life": life, "today": today}
+    return {"name": name, "leads": leads, "ips": ips, "services": services, "appendix": appendix, "omitted": omitted,
+            "conflicts": conflicts, "whole": whole, "cves": cves, "life": life, "today": today}
 
 
 def attribution_line(lead):
@@ -239,23 +311,44 @@ def attribution_line(lead):
         return "unattributed — no registry attribution for this address", "none"
     if m == "shodan_org":
         return (f"Shodan org field '{esc(lead.get('org_name'))}' only — a network-operator label, not an "
-                f"ownership record"), c or "low"
-    return f"registry method `{code(m)}`" + (f", org_id `{code(lead['org_id'])}`" if lead.get("org_id") else ""), c or "low"
+                f"ownership record"), esc(c or "low", 10)
+    return f"registry method `{code(m, 40)}`" + (f", org_id `{code(lead['org_id'], 60)}`" if lead.get("org_id") else ""), \
+        esc(c or "low", 10)
+
+
+def exposure_state(l, s):
+    """('active'|'stale'|'gone'|'unknown', human label) for a lead's service."""
+    if l["transport"] == L.HOST_TRANSPORT:
+        return "host", "host-level evidence"
+    if not s:
+        return "unknown", "not in the store"
+    st = s.get("status")
+    if st == "active":
+        return "active", f"currently active (last observed {s.get('date')})"
+    if st == "stale":
+        return "stale", f"stale — last observed {s.get('date')}, not seen for {s.get('days_since_seen')} d"
+    return "gone", f"no longer observed — last observed {s.get('date')}"
 
 
 def build_markdown(data):
-    today, name, leads = data["today"], esc(data["name"]), data["leads"]
-    kinds = {kind_of(l) for l in leads}
+    today, leads = data["today"], data["leads"]
+    name = esc(data["name"])
+    hist = [l for l in leads if l["status"] in ("new", "queued")
+            and exposure_state(l, data["services"].get((l["ip"], l["port"], l["transport"])))[0] == "gone"]
+    current = [l for l in leads if l not in hist]
+    kinds = {kind_of(l) for l in current}
     compromise = bool(kinds & COMPROMISE_KINDS)
     if compromise or "kev_verified" in kinds:
         priority = "HIGH — recommend action within 24 hours"
-    elif kinds & {"appliance", "ics", "shadowserver_exposure"} or any(l["confidence"] == "high" for l in leads):
+    elif kinds & {"appliance", "ics", "shadowserver_exposure"} or any(l["confidence"] == "high" for l in current):
         priority = "MEDIUM — recommend action within 7 days"
-    else:
+    elif current:
         priority = "ROUTINE — review at next maintenance window"
+    else:
+        priority = "INFORMATIONAL — historical findings only"
     ref = f"LA-EXP-{today:%Y%m%d}-{slugify(data['name']).upper()[:12]}"
     sources = "Shodan" + (", Shadowserver" if kinds & {"shadowserver_compromise", "shadowserver_exposure"} else "")
-    prev = [l for l in leads if l["status"] in PREVIOUSLY_NOTIFIED]
+    prev = [l for l in current if l["status"] in PREVIOUSLY_NOTIFIED]
     closed = [l for l in leads if l["status"] not in OPEN_STATUSES]
 
     md = [f"# Security Notification — Internet-Exposed Services Attributed to {name}", "",
@@ -270,58 +363,85 @@ def build_markdown(data):
           f"**Method:** Passive analysis of public internet-scan and abuse-report data ({sources}); no scanning, "
           "probing or access of any system", "", "---", "", "## 1. Summary", "",
           f"During routine passive monitoring of Louisiana's internet-exposed systems we identified "
-          f"**{len(data['ips'])} host(s)** attributed to {name} carrying **{len(leads)} finding(s)** of the "
-          "following kinds:", ""]
-    md += [f"- {EVIDENCE_LABEL[k]}" for k in KIND_ORDER if k in kinds]
+          f"**{len({l['ip'] for l in current})} host(s)** attributed to {name} carrying **{len(current)} current "
+          "finding(s)** of the following kinds:", ""]
+    md += [f"- {EVIDENCE_LABEL[k]}" for k in KIND_ORDER if k in kinds] or ["- (none currently observed)"]
     if prev:
         md += ["", f"{len(prev)} of these finding(s) were previously notified (marked below); this packet "
                    "re-states them because they are still observed."]
+    if hist:
+        md += ["", f"{len(hist)} further finding(s) are no longer observed and are listed for the record only."]
     if closed:
         md += ["", f"{len(closed)} finding(s) in a closed status are included because --include-closed was given."]
+    if data["conflicts"]:
+        md += ["", f"**Attribution conflict** on {len(data['conflicts'])} address(es) "
+                   f"({', '.join(ipc(i) for i in sorted(data['conflicts']))}): our records disagree on the owner; "
+                   "confirm before relying on those findings."]
     md += ["", "**This is a passive, external observation — a lead to verify, not confirmation of a breach or of "
            "a vulnerability.** We have not accessed, scanned, or interacted with your systems. The purpose of "
            "this notice is to put the information in your hands so you can investigate.", "", "---", "",
            "## 2. What we observed", "",
-           "| # | IP | Port | Service / product | Evidence type | Confidence | Scan age | Attribution | Status |",
-           "|---|---|---|---|---|---|---|---|---|"]
-    for i, l in enumerate(leads, 1):
+           "| # | IP | Port | Service / product | Evidence type | Confidence | Scan age | Exposure state | Attribution | Status |",
+           "|---|---|---|---|---|---|---|---|---|---|"]
+
+    def table_row(i, l):
         s = data["services"].get((l["ip"], l["port"], l["transport"])) or {}
         host_level = l["transport"] == L.HOST_TRANSPORT
         svc = "host-level" if host_level else (esc(L.service_desc(s)) if s else "not currently observed")
         age = days_ago(s.get("banner_ts") or s.get("date"), today) if s else days_ago(l.get("last_seen"), today)
-        src = str(s.get("banner_ts") or s.get("date"))[:10] if s else str(l.get("last_seen"))
-        age_s = f"{age} d ({src})" if age is not None else "n/a"
+        src = str(s.get("banner_ts") or s.get("date"))[:10] if s else str(l.get("last_seen"))[:10]
+        age_s = f"{age} d ({esc(src, 10)})" if age is not None else "n/a"
         _, conf = attribution_line(l)
-        port = "—" if host_level else f"{l['port']}/{l['transport']}"
-        stat = l["status"] + (f" (previously notified on {l.get('notified_on')})"
-                                   if l["status"] in PREVIOUSLY_NOTIFIED and l.get("notified_on") else "")
-        md.append(f"| {i} | `{code(l['ip'])}` | {port} | {svc} | {kind_of(l)} | {l['confidence']} | "
-                  f"{age_s} | {conf} | {stat} |")
+        port = "—" if host_level else f"{num(l['port'])}/{tp(l['transport'])}"
+        stat = status_word(l["status"]) + (f" (previously notified on {dt(l.get('notified_on'))[:10]})"
+                                           if l["status"] in PREVIOUSLY_NOTIFIED and l.get("notified_on") else "")
+        state = exposure_state(l, s)[1]
+        flag = " ⚠ attribution conflict" if l["ip"] in data["conflicts"] else ""
+        return (f"| {i} | `{ipc(l['ip'])}` | {port} | {svc} | {kind_of(l)} | {esc(l['confidence'], 10)} | {age_s} | "
+                f"{esc(state, 80)} | {conf}{flag} | {stat} |")
+
+    for i, l in enumerate(current, 1):
+        md.append(table_row(i, l))
     newest = max((str(s.get("date")) for s in data["services"].values()), default="n/a")
     md += ["", "Scan age = days since the scanner's own banner timestamp (or, if absent, our collection date / "
-           f"the report date). Our newest collection day is {newest}.", "", "### Finding detail", ""]
-    for i, l in enumerate(leads, 1):
+           f"the report date). Our newest collection day is {esc(newest, 10)}. Exposure state comes from "
+           "exposure_status: active = seen in the last 14 days, stale = 15–45 days, gone = longer.", ""]
+    if hist:
+        md += ["### No longer observed — historical", "",
+               "These findings were raised but the service has not been observed for more than 45 days; they are "
+               "listed so you can confirm the change was deliberate.", "",
+               "| # | IP | Port | Service / product | Evidence type | Confidence | Scan age | Exposure state | Attribution | Status |",
+               "|---|---|---|---|---|---|---|---|---|---|"]
+        md += [table_row(f"H{i}", l) for i, l in enumerate(hist, 1)]
+        md.append("")
+    md += ["### Finding detail", ""]
+    for i, l in enumerate(current + hist, 1):
         s = data["services"].get((l["ip"], l["port"], l["transport"])) or {}
         lf = data["life"].get((l["ip"], l["port"], l["transport"]))
         basis, conf = attribution_line(l)
         host_level = l["transport"] == L.HOST_TRANSPORT
-        md += [f"#### Finding {i}: {code(l['ip'])}" + ("" if host_level else f":{l['port']}/{l['transport']}")
-               + f" — {EVIDENCE_LABEL.get(kind_of(l), kind_of(l))}", "",
-               f"- **Evidence type / confidence:** {kind_of(l)} / {l['confidence']}"
-               + (f" (severity {esc(l['severity'])})" if l.get("severity") else ""),
-               f"- **Exact evidence:** {esc(l['evidence'], 400)}"]
+        md += [f"#### Finding {i}: {ipc(l['ip'])}" + ("" if host_level else f":{num(l['port'])}/{tp(l['transport'])}")
+               + f" — {EVIDENCE_LABEL[kind_of(l)]}", "",
+               f"- **Evidence type / confidence:** {kind_of(l)} / {esc(l['confidence'], 10)}"
+               + (f" (severity {esc(l['severity'], 10)})" if l.get("severity") else ""),
+               f"- **Exact evidence:** {esc(l['evidence'], 400)}",
+               f"- **Exposure state:** {esc(exposure_state(l, s)[1], 100)}"]
         if l["status"] in PREVIOUSLY_NOTIFIED:
-            md.append(f"- **Previously notified:** on {l.get('notified_on') or 'unknown date'}"
-                      + (f" via {esc(l.get('notified_via'))}" if l.get("notified_via") else "") + " — still observed")
+            md.append(f"- **Previously notified:** on {dt(l.get('notified_on'))[:10] if l.get('notified_on') else 'unknown date'}"
+                      + (f" via {esc(l.get('notified_via'), 40)}" if l.get("notified_via") else "")
+                      + (" — still observed" if exposure_state(l, s)[0] in ("active", "host") else
+                         f" — last observed {dt(s.get('date'))[:10] if s else 'n/a'}"))
         elif l["status"] not in OPEN_STATUSES:
-            md.append(f"- **Status:** {l['status']} (closed; included on request)")
+            md.append(f"- **Status:** {status_word(l['status'])} (closed; included on request)")
+        if l["ip"] in data["conflicts"]:
+            md.append("- **Attribution conflict:** our lead records disagree on this address's owner — verify before acting")
         if s:
             md.append(f"- **Service as observed:** {esc(L.service_desc(s))}"
-                      + (f"; module `{code(s.get('service'))}`" if s.get("service") else "")
+                      + (f"; module `{code(s.get('service'), 40)}`" if s.get("service") else "")
                       + (f"; HTTP title \"{esc(s['http_title'], 80)}\"" if s.get("http_title") else "")
                       + (f"; cpe `{code(s['cpe23'], 120)}`" if s.get("cpe23") else ""))
-            md.append(f"- **Observed:** scanner banner {esc(str(s.get('banner_ts'))[:19])}; our collection date "
-                      f"{s.get('date')}; freshness `{s.get('status')}` ({s.get('days_since_seen')} d since seen)")
+            md.append(f"- **Observed:** scanner banner {dt(s.get('banner_ts'))}; our collection date {dt(s.get('date'))[:10]}; "
+                      f"freshness `{esc(s.get('status'), 10)}` ({num(s.get('days_since_seen'))} d since seen)")
             if s.get("cert_cn") or s.get("cert_org"):
                 md.append(f"- **TLS certificate (for reference, not attribution):** CN `{code(s.get('cert_cn'))}` "
                           f"O `{code(s.get('cert_org'))}` issuer `{code(s.get('cert_issuer'))}`"
@@ -331,17 +451,17 @@ def build_markdown(data):
             if s.get("org"):
                 md.append(f"- **Network operator (Shodan org, reference only):** {esc(s['org'])}")
         if lf:
-            md.append(f"- **Dwell:** first seen in our data {lf['first_seen']}, last {lf['last_seen']} "
-                      f"({lf['days_observed']} collection day(s) over {lf['span_days']} d)")
+            md.append(f"- **Dwell:** first seen in our data {dt(lf['first_seen'])[:10]}, last {dt(lf['last_seen'])[:10]} "
+                      f"({num(lf['days_observed'])} collection day(s) over {num(lf['span_days'])} d)")
         for c in sorted(data["cves"].get((l["ip"], l["port"], l["transport"]), []),
                         key=lambda c: (not c["verified"], -(c["epss"] or 0))):
             if l["evidence_type"] in L.CVE_TYPES and c["cve"] != l.get("evidence_key"):
                 continue
-            md.append(f"- **{esc(c['cve'])}** — CISA KEV; {'VERIFIED by scanner' if c['verified'] else 'version-inferred'}; "
-                      f"CVSS {c['cvss'] or 'n/a'}; EPSS {L._fmt_epss(c['epss'])}")
-        md += [f"- **Attribution basis:** {basis} — confidence **{esc(conf)}**",
-               f"- **Lead id:** `{l['lead_id']}` (status {l['status']}, first raised {l['first_seen']}, "
-               f"last observed {l.get('last_seen')})", ""]
+            md.append(f"- **{esc(c['cve'], 20)}** — CISA KEV; {'VERIFIED by scanner' if c['verified'] else 'version-inferred'}; "
+                      f"CVSS {esc(c['cvss'], 6)}; EPSS {L._fmt_epss(c['epss'])}")
+        md += [f"- **Attribution basis:** {basis} — confidence **{conf}**",
+               f"- **Lead id:** `{lid(l['lead_id'])}` (status {status_word(l['status'])}, first raised "
+               f"{dt(l['first_seen'])[:10]}, last scan {dt(l.get('last_scan_ts') or l.get('last_seen'))})", ""]
 
     md += ["---", "", "## 3. What this is not", "",
            "- **Not a scan of your systems.** Every observation above comes from a third-party internet-scan index "
@@ -352,7 +472,8 @@ def build_markdown(data):
            "- **Not a confirmed compromise.** " + ("This packet contains a compromise indicator; it is a credible "
            "lead that requires your verification — scanner threat flags and sinkhole hits can be stale, a shared "
            "address, or a false positive." if compromise else "No compromise indicator is included in this packet."),
-           "- **Not necessarily current.** Findings reflect the scan ages shown; a service may have changed since.",
+           "- **Not necessarily current.** Findings reflect the scan ages and exposure states shown; a service may "
+           "have changed since.",
            "- **Attribution is evidence-graded, not asserted.** The basis and confidence for tying each address to "
            f"{name} are stated per finding; if an address is not yours, please tell us so we can correct our records.",
            "", "---", "", "## 4. Recommended actions (in priority order)", ""]
@@ -376,7 +497,7 @@ def build_markdown(data):
            f"- **Handling:** {TLP_PLACEHOLDER}. Recipients may share this document only within their organisation "
            "and with those who need it to act on the information. Provided as a good-faith defensive courtesy; it "
            "confers no warranty and imposes no obligation.",
-           "- **Source data:** passive scan data collected " + (f"{min(dates)} to {max(dates)}" if dates else "n/a")
+           "- **Source data:** passive scan data collected " + (f"{esc(min(dates), 10)} to {esc(max(dates), 10)}" if dates else "n/a")
            + f"; leads table as of {today}.", "", "---", "", "## Reviewer sign-off", "",
            "This packet is a DRAFT until every row below is completed.", "",
            "| Role | Name | Date | Signature |", "|---|---|---|---|",
@@ -386,15 +507,20 @@ def build_markdown(data):
            "Checklist before release: attribution confirmed for every address; TLP marking set; contact block "
            "filled; evidence dates re-checked against the store; "
            + ("compromise claim independently reviewed." if compromise else "no compromise claim is made."), "",
-           "---", "", "## Appendix A — Currently active services on these hosts", "",
-           f"Only services observed in the last 14 days on hosts whose attribution names {name}.", "",
-           "| IP | Port | Product / service | Last seen | Title / cert |", "|---|---|---|---|---|"]
-    for key in sorted(data["active_same_org"], key=lambda k: (k[0], k[1])):
-        s = data["active_same_org"][key]
-        md.append(f"| `{code(s['ip'])}` | {s['port']}/{s['transport']} | {esc(L.service_desc(s))} | "
-                  f"{s['date']} | {esc(s.get('http_title') or s.get('cert_cn') or '', 60)} |")
-    if not data["active_same_org"]:
-        md.append("| — | — | no currently active service attributed to this organisation | — | — |")
+           "---", "", "## Appendix A — Services on these hosts", "",
+           "Lead services are always listed. Other services on an address are listed only where the address has "
+           f"whole-address ownership recorded for {name} (registry network / OTS CIDR, high confidence).", ""]
+    if data["omitted"]:
+        md.append(f"Other services on {len(data['omitted'])} address(es) omitted: shared/unresolved ownership "
+                  f"({', '.join(ipc(i) for i in data['omitted'])}).")
+        md.append("")
+    md += ["| IP | Port | Product / service | Exposure state | Last seen | Title / cert |", "|---|---|---|---|---|---|"]
+    for key in sorted(data["appendix"], key=lambda k: (k[0], k[1] or 0)):
+        s = data["appendix"][key]
+        md.append(f"| `{ipc(s['ip'])}` | {num(s['port'])}/{tp(s['transport'])} | {esc(L.service_desc(s))} | "
+                  f"{esc(s.get('status'), 10)} | {dt(s['date'])[:10]} | {esc(s.get('http_title') or s.get('cert_cn') or '', 60)} |")
+    if not data["appendix"]:
+        md.append("| — | — | no service listed | — | — | — |")
     return "\n".join(md) + "\n"
 
 
@@ -482,20 +608,17 @@ def main(argv=None):
     g.add_argument("--org", help="org_name or org_id (exact, case-insensitive; else whole-word, must be unique)")
     g.add_argument("--ip")
     ap.add_argument("--db", default=L.DB_PATH)
-    ap.add_argument("--leads-db", default=L.LEADS_DB)
+    ap.add_argument("--leads-dir", default=L.LEADS_DIR)
     ap.add_argument("--out-dir", default=PACKET_DIR)
     ap.add_argument("--date", help="YYYY-MM-DD (default today)")
-    ap.add_argument("--include-closed", action="store_true",
-                    help="also include remediated / disputed / false_positive / suppressed leads")
+    ap.add_argument("--include-closed", action="store_true")
     ap.add_argument("--pdf", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="print the markdown, write nothing")
     args = ap.parse_args(argv)
     today = L._parse_date(args.date) if args.date else date.today()
     if args.date and today is None:
         ap.error("--date must be YYYY-MM-DD")
-    if not os.path.exists(args.leads_db):
-        raise SystemExit("No leads yet — run `leads.py refresh` first.")
-    ctx = L.open_ctx(args.db, args.leads_db, write=False)
+    ctx = L.open_ctx(args.db, args.leads_dir, write=False)
     try:
         data = gather(ctx, today, org=args.org, ip=args.ip, include_closed=args.include_closed)
     finally:

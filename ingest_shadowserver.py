@@ -29,15 +29,18 @@ Two ways in:
 
 Durability (a store rebuild wipes exposure.duckdb): the AUTHORITATIVE record is
 store/shadowserver/events.parquet (append + dedupe on (report_type, timestamp, ip,
-port, tag)) plus store/shadowserver/manifest.json (per file: sha-256, original
-filename, report_type, rows loaded/duplicate/quarantined, ingested_on). Idempotence
-is by file sha in the manifest; report_type comes from the manifest/original name,
-never from the processed filename. Each file is all-or-nothing: the parquet is
-rewritten to a temp file and renamed, then the manifest, then the store table is
-re-published from the parquet, then the file moves to processed/. Rows with surplus
-fields, a missing ip/timestamp, an unparseable or FUTURE timestamp go to
+port, protocol, tag)) plus store/shadowserver/manifest.json keyed by
+"<sha256>:<report_type>" (original filename, report_type, rows loaded / duplicate /
+quarantined, ingested_on). leads.py reads the parquet, never the store table. A
+whole `ingest` run holds store/shadowserver/.ingest.lock (fcntl.flock) across
+manifest read -> dedupe -> parquet publish -> manifest write -> input move; a second
+ingester exits cleanly (or waits with --wait) and never proceeds without the lock.
+Each file is all-or-nothing: parquet to a pid-unique temp file + rename, then the
+manifest, then the store table is re-published from the parquet (every run, and on
+`restore`); if that publication fails the input stays in incoming/ so it retries.
+Rows with surplus fields, a missing/invalid ip, an out-of-range port, a garbage
+protocol, a missing/unparseable/FUTURE timestamp go to
 reference/shadowserver/quarantine/<file>.quarantine.csv with a reason — never raise.
-`restore_table` re-creates the store table from the parquet after a rebuild.
 
 Subscribing: reports go to the NETBLOCK OWNER (or a CSIRT with authority over the
 space). For Louisiana the natural subscriber is OTS (owner of the state netblocks)
@@ -56,9 +59,11 @@ Usage:
 """
 import argparse
 import csv
+import fcntl
 import glob
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -86,7 +91,9 @@ EVENT_COLUMNS = ["report_type", "timestamp", "ip", "port", "protocol", "asn", "g
 EVENT_TYPES = {"timestamp": "TIMESTAMP", "port": "INTEGER", "ingested_on": "DATE"}
 EVENTS_DDL = "CREATE TABLE IF NOT EXISTS shadowserver_events (" + ", ".join(
     f"{c} {EVENT_TYPES.get(c, 'VARCHAR')}" for c in EVENT_COLUMNS) + ")"
-DEDUPE_KEY = ("report_type", "timestamp", "ip", "port", "tag")
+DEDUPE_KEY = ("report_type", "timestamp", "ip", "port", "protocol", "tag")
+PROTOCOLS = {"tcp", "udp", "icmp", "other"}
+LOCK_NAME = ".ingest.lock"
 CORE = ("timestamp", "ip", "protocol", "port", "asn", "geo", "tag")
 _FILENAME_RE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2})-(?P<type>[a-z0-9_]+)(?:-(?P<scope>.+))?\.csv$", re.I)
 COMPROMISE_MARKERS = ("sinkhole", "drone", "spam", "compromised", "malware", "botnet", "cc_", "_cc",
@@ -188,6 +195,10 @@ def parse_report(path, today=None):
             ts = parse_ts(row.get("timestamp"))
             if not ip:
                 bad.append(("missing ip", row)); continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                bad.append(("invalid ip", row)); continue
             if not row.get("timestamp"):
                 bad.append(("missing timestamp", row)); continue
             if ts is None:
@@ -195,10 +206,21 @@ def parse_report(path, today=None):
             if ts >= horizon:
                 bad.append(("future-dated", row)); continue
             port = row.get("port")
-            try:
-                port = int(port) if port not in (None, "") else None
-            except ValueError:
+            if port not in (None, ""):
+                try:
+                    port = int(port)
+                except ValueError:
+                    bad.append(("invalid port", row)); continue
+                if not 0 <= port <= 65535:
+                    bad.append(("port out of range", row)); continue
+            else:
                 port = None
+            proto = (row.get("protocol") or "").lower()
+            if proto and proto not in PROTOCOLS:
+                if re.fullmatch(r"[a-z0-9_-]{1,16}", proto):
+                    row["protocol_raw"], proto = proto, "other"
+                else:
+                    bad.append(("invalid protocol", row)); continue
             detail = {k: v for k, v in row.items() if k not in CORE and v != ""}
             detail["_file_sha"] = sha
             detail["_source_file"] = os.path.basename(path)
@@ -206,7 +228,7 @@ def parse_report(path, today=None):
             if scope:
                 detail["_scope"] = scope
             events.append({"report_type": report_type, "timestamp": ts, "ip": ip, "port": port,
-                           "protocol": (row.get("protocol") or "").lower() or None,
+                           "protocol": proto or None,
                            "asn": row.get("asn") or None, "geo": row.get("geo") or None,
                            "tag": row.get("tag") or row.get("infection") or row.get("family") or None,
                            "severity": severity_for(report_type, row),
@@ -228,7 +250,7 @@ def load_manifest(path=MANIFEST):
 
 def save_manifest(m, path=MANIFEST):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = f"{path}.tmp-{os.getpid()}"
     with open(tmp, "w") as fh:
         json.dump(m, fh, indent=2, sort_keys=True)
     os.replace(tmp, path)
@@ -260,7 +282,7 @@ def append_parquet(events, parquet=EVENTS_PARQUET):
             con.execute(f"INSERT INTO shadowserver_events SELECT * FROM read_parquet('{parquet}')")
         con.executemany(f"INSERT INTO shadowserver_events VALUES ({', '.join('?' * len(EVENT_COLUMNS))})",
                         [[e[c] for c in EVENT_COLUMNS] for e in events])
-        tmp = parquet + ".tmp"
+        tmp = f"{parquet}.tmp-{os.getpid()}"
         con.execute(f"COPY (SELECT * FROM shadowserver_events ORDER BY timestamp, ip, port) TO '{tmp}' (FORMAT PARQUET)")
         os.replace(tmp, parquet)
     finally:
@@ -305,7 +327,9 @@ def ingest_file(con, path, today, dry_run=False, processed_dir=PROCESSED, quaran
         log(f"  {name}: unreadable ({exc}) — left in place")
         return "error", 0
     manifest = load_manifest(manifest_path)
-    if sha in manifest["files"]:
+    _, rtype, _ = parse_filename(path)
+    ident = f"{sha}:{rtype}"
+    if ident in manifest["files"]:
         status, events, bad, new = "duplicate", [], [], []
     else:
         try:
@@ -313,7 +337,7 @@ def ingest_file(con, path, today, dry_run=False, processed_dir=PROCESSED, quaran
         except (OSError, csv.Error, UnicodeDecodeError) as exc:
             log(f"  {name}: unparseable ({exc}) — left in place")
             return "error", 0
-        seen = existing_keys(parquet) if not dry_run else existing_keys(parquet)
+        seen = existing_keys(parquet)
         new = []
         for e in events:
             k = _key(e)
@@ -332,30 +356,57 @@ def ingest_file(con, path, today, dry_run=False, processed_dir=PROCESSED, quaran
     if status == "loaded":
         append_parquet(new, parquet)
     if status != "duplicate":
-        _, rtype, _ = parse_filename(path)
-        manifest["files"][sha] = {"filename": name, "report_type": rtype, "rows_loaded": len(new),
-                                  "rows_duplicate": len(events) - len(new), "rows_quarantined": len(bad),
-                                  "ingested_on": today.isoformat()}
+        manifest["files"][ident] = {"sha256": sha, "filename": name, "report_type": rtype, "rows_loaded": len(new),
+                                    "rows_duplicate": len(events) - len(new), "rows_quarantined": len(bad),
+                                    "ingested_on": today.isoformat()}
         save_manifest(manifest, manifest_path)
-        restore_table(con, parquet)
+    if not restore_table(con, parquet):
+        log(f"  {name}: events saved to parquet but the store table could NOT be published — "
+            f"input left in incoming/ to retry")
+        return "unpublished", len(new)
     os.makedirs(processed_dir, exist_ok=True)
     os.replace(path, os.path.join(processed_dir, f"{sha[:8]}-{name}"))
     log(f"  {name}: {status}, {len(new)} new event(s)")
     return status, len(new)
 
 
+def acquire_lock(parquet, wait=False):
+    """Exclusive flock on <parquet dir>/.ingest.lock. Returns the open file (keep it
+    open for the whole run) or None when another ingester holds it."""
+    lock_path = os.path.join(os.path.dirname(parquet), LOCK_NAME)
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def ingest_dir(con, incoming=INCOMING, today=None, dry_run=False, processed_dir=PROCESSED,
-               quarantine_dir=QUARANTINE, parquet=EVENTS_PARQUET, manifest_path=MANIFEST):
+               quarantine_dir=QUARANTINE, parquet=EVENTS_PARQUET, manifest_path=MANIFEST, wait=False):
+    """Every file under incoming/, under ONE lock held from manifest read to input
+    move. Returns {status: n}, or None when the lock could not be taken."""
     today = today or date.today()
-    files = sorted(glob.glob(os.path.join(incoming, "*.csv")) + glob.glob(os.path.join(incoming, "*.CSV")))
-    if not files:
-        log(f"no CSV files under {incoming}")
-        return {}
-    totals = {}
-    for f in files:
-        status, n = ingest_file(con, f, today, dry_run, processed_dir, quarantine_dir, parquet, manifest_path)
-        totals[status] = totals.get(status, 0) + (n if status == "loaded" else 1)
-    return totals
+    lock = acquire_lock(parquet, wait)
+    if lock is None:
+        log(f"another ingest holds {os.path.join(os.path.dirname(parquet), LOCK_NAME)} — exiting without changes")
+        return None
+    try:
+        files = sorted(glob.glob(os.path.join(incoming, "*.csv")) + glob.glob(os.path.join(incoming, "*.CSV")))
+        totals = {}
+        for f in files:
+            status, n = ingest_file(con, f, today, dry_run, processed_dir, quarantine_dir, parquet, manifest_path)
+            totals[status] = totals.get(status, 0) + (n if status == "loaded" else 1)
+        if not files:
+            log(f"no CSV files under {incoming}")
+        if not dry_run and con is not None and os.path.exists(parquet):
+            restore_table(con, parquet)          # the store copy is republished every run
+        return totals
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
 
 
 # --- API client ------------------------------------------------------------------
@@ -454,6 +505,7 @@ def main(argv=None):
     ig.add_argument("--parquet", default=EVENTS_PARQUET)
     ig.add_argument("--manifest", default=MANIFEST)
     ig.add_argument("--dry-run", action="store_true")
+    ig.add_argument("--wait", action="store_true", help="wait for a running ingest instead of exiting")
     rs = sub.add_parser("restore", help="re-create the store table from the parquet (after a rebuild)")
     rs.add_argument("--db", default=DB_PATH)
     rs.add_argument("--parquet", default=EVENTS_PARQUET)
@@ -470,10 +522,13 @@ def main(argv=None):
         con = None if args.dry_run else _open_store(args.db)
         try:
             totals = ingest_dir(con, args.incoming, dry_run=args.dry_run, processed_dir=args.processed,
-                                quarantine_dir=args.quarantine, parquet=args.parquet, manifest_path=args.manifest)
+                                quarantine_dir=args.quarantine, parquet=args.parquet, manifest_path=args.manifest,
+                                wait=args.wait)
         finally:
             if con:
                 con.close()
+        if totals is None:
+            return 3
         log("ingest summary: " + (", ".join(f"{k}={v}" for k, v in totals.items()) or "nothing to do"))
         return 0
     if args.cmd == "restore":

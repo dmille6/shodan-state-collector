@@ -118,12 +118,33 @@ RDAP is only consulted for ASNs seen on `government`, `education` or
 `critical_infrastructure` hosts. All external calls are cached and fail-soft: a
 feed being down lowers confidence for that run, it never aborts it.
 
+## The `conflict` column
+
+`ip_attribution.conflict` is `''` or a structured note, and a row with a
+non-empty conflict is **capped at medium** whatever its method:
+
+| conflict | meaning |
+|---|---|
+| `rdns=la-a,la-b;cert=la-c` | rDNS names and certificate names on this IP, evaluated together, point at more than one org (orgs listed best-first per source; a part is omitted when that source has no match) |
+| `prefix=la-p;rdns=la-a` / `prefix=la-p;cert=la-c` | the IP is inside a registry prefix owned by `la-p` but carries names of another org (e.g. a LONI-hosted university, a Legislature host under `la.gov`) |
+| `duplicate prefix P: la-a vs la-b` / `duplicate domain D: …` / `duplicate asn A: …` | the matched prefix / domain / ASN was listed for two different orgs; the first row was used, the other is recorded |
+
+Several notes are joined with `;`. `build_store.py` refuses to set a tier
+from the registry when `conflict` is non-empty; the row still names the
+best-supported org so an analyst can resolve it. `registry.Attributor.lookup()`
+returns the column as `conflict` (`''` for live prefix hits).
+
 ## Precedence on duplicates and ambiguous names
 
-- **Equal prefix / ASN / domain listed twice**: the first row wins, and the
-  conflict is logged (`networks: prefix … also listed for …; keeping …`). OTS
-  rows are loaded before `networks.csv`, so an OTS prefix always beats a curated
-  row for the same prefix; `domains.csv` rows beat domains taken from `orgs.csv`.
+- **Longest prefix always wins first.** A more specific curated prefix
+  (`10.0.5.0/24`, `networks.csv`) beats a wider OTS prefix (`10.0.0.0/8`)
+  for an address inside both — that is the longest-prefix rule, not a conflict.
+- **Equal prefixes**: the first row wins and OTS rows are loaded before
+  `networks.csv`, so an OTS prefix beats a curated row for the *same* prefix.
+  Equal ASN rows and equal domains likewise keep the first row (`domains.csv`
+  before domains taken from `orgs.csv`). Every discarded duplicate that names a
+  different org is logged (`networks: prefix … also listed for …; keeping …`)
+  and, when it touches an IP, surfaces in that row's `conflict`.
 - **Name normalisation** (`build_registry.norm_org_name`): lower-case;
   punctuation to spaces (`L.L.C.` and `LLC` become the same); only a *leading*
   "the" dropped; corporate suffix words (Inc, LLC, Corp, Company, Co, Ltd, …)
@@ -142,12 +163,32 @@ feed being down lowers confidence for that run, it never aborts it.
   names. Answers cached 90 days (errors 3 days).
 - Nothing else is contacted. No host in the store is ever touched.
 
-## Output safety
+## Output safety: generations and the CURRENT pointer
 
-The four parquet files are written as **one generation**: each is staged as
-`<name>.<pid>.tmp`, and only once all are complete are they renamed into place
-back-to-back, so a reader never mixes an old `ip_attribution` with a new
-`registry_orgs`. If the store cannot be read at all (not merely empty), the
-three registry tables are refreshed but **`ip_attribution.parquet` is not
-rewritten** — the previous file is kept and the log says
-`store unreadable: ip_attribution.parquet NOT rewritten`.
+```
+store/registry/
+  CURRENT                      <- one line: the live generation's directory name
+  gen-20260915T222013/         <- registry_orgs / registry_networks / registry_domains / ip_attribution .parquet
+  gen-20260915T210000/         <- previous (the newest 3 generations are kept)
+  ...
+```
+
+Every build writes all four files into a new `gen-<timestamp>/` directory and
+only then switches `CURRENT` with an atomic rename, so `registry.Attributor`
+(which reads the pointer; flat files in `store/registry/` are the fallback
+when there is no pointer) always sees one consistent set. A failed build
+leaves the pointer untouched and removes its half-built directory.
+
+- **Store unreadable** (not merely empty): the three registry tables are
+  rebuilt and the previous generation's `ip_attribution.parquet` is **copied
+  forward** unchanged; the log says `store unreadable: ip_attribution.parquet
+  NOT rebuilt`.
+- **Network source down**: an expired cache record is still used when it could
+  not be refreshed — evidence carries `(stale as_of <date>)` — and is replaced
+  only by fresher data (RDAP keeps the last *good* record beside the error).
+  If Cymru or RDAP could not be reached at all, every IP whose new row would be
+  weaker than its row in the previous generation keeps the previous row
+  (evidence: `(kept from previous build as_of …: <reason>)`).
+- `Attributor.load()` prints where it loaded from, logs every missing file
+  (`… missing — loaded empty`), and exposes `attribution_as_of` (the newest
+  `as_of` in `ip_attribution`) for reports to print.

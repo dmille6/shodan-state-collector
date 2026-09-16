@@ -19,39 +19,46 @@ that file is disposable, so:
 
 | What | Authoritative location | Copy in `exposure.duckdb` |
 |---|---|---|
-| leads + event log | `store/leads/leads.duckdb` (tables `leads` — `lead_id` PRIMARY KEY — and `lead_events`); mirrored to `store/leads/leads.parquet` + `lead_events.parquet` after every commit (temp file + atomic rename) | table `leads`, re-published by every `refresh`/`set` (`CREATE OR REPLACE TABLE`) — a convenience copy |
-| Shadowserver events | `store/shadowserver/events.parquet` (append + dedupe on `report_type, timestamp, ip, port, tag`) + `store/shadowserver/manifest.json` (per file: sha-256, original filename, report_type, rows loaded / duplicate / quarantined, date) | table `shadowserver_events`, re-created from the parquet by `ingest` and by `ingest_shadowserver.py restore`; `leads.py refresh` reads the parquet directly when the table is missing |
+| leads + event log | `store/leads/leads.duckdb` (tables `leads` — `lead_id` PRIMARY KEY — and `lead_events`) | table `leads`, re-published by every `refresh`/`set` — a convenience copy |
+| lead snapshots | `store/leads/snapshots/<generation>/{leads,lead_events}.parquet`; `store/leads/CURRENT` names the generation to restore from; the newest 5 are kept | — |
+| Shadowserver events | `store/shadowserver/events.parquet` + `store/shadowserver/manifest.json` | table `shadowserver_events`, re-published by every `ingest` run and by `restore`; **`leads.py` reads the parquet, never the table** |
 
-`set` writes the parquet mirror **inside** its transaction, before commit; if the
-mirror write fails the status change is rolled back and reported as not saved.
-`refresh` applies all its changes in one transaction, then mirrors, then publishes
-the copy. If the store is locked by a rebuild the authoritative write still
-happens and only the copy lags (logged). If `leads.duckdb` itself is lost,
-`refresh` restores it from the parquet mirror.
+Durability rules: `refresh` applies all changes in one transaction, then writes
+a new snapshot generation (nothing existing is replaced), then publishes
+`CURRENT` atomically, then re-publishes the store copy. `set` writes the
+snapshot **inside** its transaction, before commit; if the snapshot fails the
+change is rolled back and reported as not saved; if the commit fails the
+snapshot is discarded and `CURRENT` is untouched. If `leads.duckdb` is lost,
+`refresh` restores from the generation `CURRENT` names. **Migration:** the first
+run on a fresh `leads.duckdb` imports a legacy `leads` table from the store
+transactionally and maps old KEV lead ids (no CVE in the hash) onto the new
+per-CVE leads: a legacy lead in suppressed / false_positive / notified /
+acknowledged passes its status (and notification fields) to every per-CVE lead
+of that service that exists at migration time, with a `migrated_from` event; if
+the legacy lead covered more than one CVE the new leads are flagged
+`needs_attribution_review`.
 
 ## Vocabulary
 
 | Term | Meaning |
 |---|---|
-| **lead** | one (ip, port, transport, evidence_type[, cve]) with a reason to notify; `lead_id = sha1("ip\|port\|transport\|evidence_type[\|cve]")[:16]` — the CVE is part of the identity for `kev_verified` / `kev_inferred`, so suppressing one inferred CVE never hides a different one |
-| **host-level lead** | evidence about the address, not one service: `port 0`, `transport 'host'` — a threat-intel listing, a compromise flag whose archive carries no port, and every Shadowserver *compromise*-class event (its `port` column is the infected host's **source** port, never an exposed service) |
-| **tier** | the host's consequence tier from the classifier (`critical_infrastructure`, `government`, `education`, `small_business`, `unclassified`, `out_of_state_gov`), taken from the host's **newest observation** in `latest_observed`; for a host not in the store, derived from the registry sector |
-| **sector** | registry sector when the ip is attributed; else derived from the tier |
-| **priority tiers** | `government`, `education`, `critical_infrastructure` — the only tiers for which weaker (inferred) evidence becomes a lead |
-| **never a lead** | `residential` (a subscriber line is not an organisation we notify — aggregate statistics only) and `honeypot` (not a victim) |
-| **attribution** (`org_id`, `org_name`, `attr_method`, `attr_confidence`) | carried on every lead, separate from evidence confidence: registry `ip_attribution.parquet` (method/confidence as recorded) → the store's `attr_*` columns → Shodan `org` field as method `shodan_org`, confidence `low` → `unattributed` / `none` |
-| **first_seen** | the refresh date that first raised the lead |
-| **last_seen** | the newest **observation** date supporting the lead (collection day, ledger `last_seen`, Shadowserver event date) |
-| **last_evaluated** | the refresh date that last looked at the lead |
-| **severity** | the evidence's own severity (`high`/`medium`/`low`; for Shadowserver, the report's) |
-| **evidence_key** | the CVE, the appliance label, the tripwire selectors, `compromise:<types>` / `exposure:<types>` for Shadowserver, the feed names for IOC |
+| **lead** | one (ip, port, transport, evidence_type[, cve]) with a reason to notify; `lead_id = sha1("ip\|port\|transport\|evidence_type[\|cve]")[:16]` — the CVE is part of the identity for `kev_verified` / `kev_inferred` |
+| **host-level lead** | `port 0`, `transport 'host'` — a threat-intel listing, a compromise flag whose archive carries no port, every Shadowserver *compromise*-class event (its `port` column is the infected host's **source** port, never an exposed service) |
+| **tier** | the host's consequence tier from its **newest observation** in `latest_observed`; for a host not in the store, derived from the registry sector |
+| **eligible / eligibility_reason** | decided once per ip per refresh from that tier: `residential` and `honeypot` hosts are never notification targets. Ineligibility **never changes status** — the lead is hidden from `list`/packets/digest (`list --include-ineligible` shows it); `prior_status` records the status at the flip; when the host is eligible again the lead simply reappears with its status intact (a `false_positive` stays a `false_positive`) |
+| **attribution** (`org_id`, `org_name`, `sector`, `attr_method`, `attr_confidence`) | registry `ip_attribution.parquet` as recorded → the store's `attr_*` columns → Shodan `org` as `shodan_org`/`low` → `unattributed`/`none`. Carried separately from evidence confidence |
+| **owner change** | between refreshes the attributed `org_id` changes (both non-empty) **or** attribution confidence drops: the notification episode is closed (`owner_changed` event with the old org and notification history), status → `new` (`prior_status` kept), `notified_on`/`notified_via`/`analyst` cleared, `needs_attribution_review = true`. Packets refuse the lead until `set <id> --review-cleared` |
+| **whole-address ownership** | `attr_method` in `ots_cidr` / `registry_network` with `high` confidence — the only case in which a packet may list *other* services on the address |
+| **first_seen / last_evaluated** | refresh dates: when the lead was first raised / last looked at |
+| **last_seen / last_scan_ts** | the newest **scan** supporting the lead: `banner_ts` (collection date only when `banner_ts` is null); the tripwire ledger's `last_banner_ts`; the Shadowserver event time. A re-collected cached banner is not a newer scan |
+| **severity / evidence_key** | the evidence's own severity; the CVE, appliance label, tripwire selectors, `compromise:<types>` / `exposure:<types>`, IOC feeds |
 
 ### Status lifecycle
 
 ```
-new ──► queued ──► notified ──► acknowledged ──► remediated ──► (NEWER evidence) ──► new
+new ──► queued ──► notified ──► acknowledged ──► remediated ──► (NEWER SCAN) ──► new
   └──► disputed | false_positive | suppressed          (analyst decisions)
-  any eligible ──► suppressed [auto: host now residential/honeypot] ──► new [reinstated]
+any ──► new [+ needs_attribution_review]               (owner change / attribution drop)
 ```
 
 | status | set by | meaning |
@@ -60,37 +67,33 @@ new ──► queued ──► notified ──► acknowledged ──► remedia
 | `queued` | analyst | selected for a packet |
 | `notified` | analyst (`set --status notified --via ...`) | packet sent; `notified_on` stamped the first time in an episode |
 | `acknowledged` | analyst | the owner confirmed receipt |
-| `remediated` | refresh | a `notified`/`acknowledged` lead whose **specific service** is `gone` in `exposure_status` (>45 days unseen); a host-level lead needs **every** service of the host gone. Merely absent from `current_state` (stale) is not remediated. Only those two statuses remediate |
-| `disputed` | analyst | the owner says it is not theirs / not vulnerable |
-| `false_positive` | analyst | we were wrong |
-| `suppressed` | analyst, or refresh (auto) | do not notify. Auto-suppression happens when the host's current tier is residential/honeypot; the note says so and the lead is reinstated as `new` if the host becomes eligible again. Analyst fields and notes are never lost |
+| `remediated` | refresh | a `notified`/`acknowledged` lead whose **specific service** is `gone` in `exposure_status` (>45 days unseen); a host-level lead needs **every** service of the host gone; stale is not remediated |
+| `disputed` / `false_positive` / `suppressed` | analyst | terminal decisions, never overwritten by refresh |
 
-Rules `refresh` obeys: it never overwrites an analyst-set status (it advances
-`last_seen`/`last_evaluated` and refreshes evidence and attribution); a
-`remediated` lead is **reopened only when a newer observation** (date >
-`last_seen`) shows the evidence again — unchanged cached evidence keeps it
-remediated; reopening starts a **new notification episode** (`notified_on` /
-`notified_via` cleared, the previous episode recorded in `notes` and
-`lead_events`). Every change is appended to `notes` with its date and logged to
-`lead_events(ts, lead_id, event, detail)`.
+`refresh` never overwrites an analyst-set status; a `remediated` lead is reopened
+only by a **newer scan** (`last_scan_ts` advances) and that starts a **new
+episode** (`notified_on`/`notified_via` cleared, the previous episode recorded in
+`notes` and `lead_events`). Every change is appended to `notes` with its date
+and logged to `lead_events(ts, lead_id, event, detail)` (`created`, `status`,
+`reopened`, `remediated`, `ineligible`, `eligible_again`, `owner_changed`,
+`review_cleared`, `imported_legacy`, `migrated_legacy_id`, `migrated_from`).
 
 ## Evidence types and confidence
 
 | evidence_type | confidence | rule | tiers |
 |---|---|---|---|
-| `kev_verified` | high | a CISA-KEV CVE that Shodan itself **verified** on the host; one lead per CVE | all but never-lead |
-| `compromise_tag` | high | host in `compromise_hits/seen_ledger.json` with `last_seen` in the last **30 days**; port/transport from the hit archives, else host-level | all but never-lead |
-| `shadowserver` | high (compromise class) / medium (exposure class) | a `shadowserver_events` row in the last **14 days**. Compromise-class reports (sinkhole/drone/microsoft_sinkhole/spam/compromised_website/malware_url/botnet/cc …) → host-level, "possible infection" wording. Exposure-class (scan_*/vulnerable_*/exposed_*/open_*/accessible_*/ics/blocklist …) → per exposed port, "exposure to verify" wording. Unknown types are treated as exposure (the weaker claim) | all but never-lead |
-| `ics` | medium | an ICS scan module, an ICS port (`triage_report.ICS_PORTS`) or Shodan's `ics` tag — never on a honeypot | all but never-lead |
+| `kev_verified` | high | a CISA-KEV CVE that Shodan itself **verified** on the host; one lead per CVE | all eligible |
+| `compromise_tag` | high | host in `compromise_hits/seen_ledger.json` with `last_seen` in the last **30 days**; port/transport from the hit archives, else host-level; scan time = ledger `last_banner_ts` | all eligible |
+| `shadowserver` | high (compromise) / medium (exposure) | an event in `store/shadowserver/events.parquet` in the last **14 days**. Compromise-class (sinkhole / drone / microsoft_sinkhole / spam / compromised_website / malware_url / botnet / cc …) → host-level, "possible infection" wording. Exposure-class (scan_* / vulnerable_* / exposed_* / open_* / accessible_* / ics / blocklist …) → per exposed port, "exposure to verify" wording. Unknown types → exposure (the weaker claim) | all eligible |
+| `ics` | medium | an ICS scan module, an ICS port (`triage_report.ICS_PORTS`) or Shodan's `ics` tag — never on a honeypot | all eligible |
 | `appliance` | medium | `build_store.APPLIANCE_PATTERNS` — the **same** regex list the `appliance_exposure` view uses — over product / cpe23 / http_title | priority tiers only |
 | `kev_inferred` | medium | a KEV CVE inferred from the banner version, **not** verified; one lead per CVE | priority tiers only |
-| `ioc_match` | medium | ip in `reference/ioc_ips.json` and known to us (in the store or in the registry) — host-level; not re-raised while every service of the host is gone | all but never-lead |
+| `ioc_match` | medium | the host appears in the store's `ioc_matches` view — exact-ip hits **and** CIDR-range hits (Spamhaus DROP etc.); host-level, evidence names feeds and ranges. Fallback without the view: the JSON's ip keys (never `_cidrs` / `_meta`) against `current_state` | all eligible |
 | `cred_leak` | — | reserved; accepted by `set`, never generated | — |
 
 Ranking (`list`, packets): `kev_verified` > `compromise_tag` > `shadowserver` >
-`ics` > `appliance` > `kev_inferred` > `ioc_match`, then severity (so a
-Shadowserver compromise outranks a Shadowserver exposure), then EPSS of the
-lead's own CVE (or the service's worst), then tier.
+`ics` > `appliance` > `kev_inferred` > `ioc_match`, then severity, then EPSS of
+the lead's own CVE (or the service's worst), then tier.
 
 ## Running
 
@@ -98,25 +101,26 @@ lead's own CVE (or the service's worst), then tier.
 cd /opt/shodan_query
 venv/bin/python leads.py refresh                 # after the nightly store build; idempotent
 venv/bin/python leads.py refresh --dry-run
-venv/bin/python leads.py list --limit 20         # shows evidence conf AND attribution conf/method
+venv/bin/python leads.py list --limit 20         # flags: R = needs attribution review, X = ineligible
 venv/bin/python leads.py list --tier government --status new
-venv/bin/python leads.py list --org "ORG-CT"     # org_id or org_name
+venv/bin/python leads.py list --org "ORG-CT" --include-ineligible
 venv/bin/python leads.py set <lead_id> --status notified --via MS-ISAC --analyst jd --note "packet LA-EXP-..."
 venv/bin/python leads.py set <lead_id> --status acknowledged --note "CISO replied"
-venv/bin/python leads.py digest                  # per-sector counts + attribution mix + remediation stats
+venv/bin/python leads.py set <lead_id> --review-cleared --analyst jd     # after confirming a changed attribution
+venv/bin/python leads.py digest                  # per-sector counts, needs-review, attribution mix, remediation stats
 venv/bin/python leads.py digest --weekly --out reports/leads_digest_$(date +%F).md
 ```
 
-`refresh` prints a per tier / evidence / status summary, the attribution-confidence
-mix and the excluded aggregates (residential, honeypot, non-priority inferred,
-unknown IOC ips). Options `--leads-db`, `--ledger`, `--hits-dir`, `--ioc`,
-`--attribution`, `--ss-parquet`, `--parquet`, `--today` exist for tests.
+`refresh` prints a per tier / evidence / status summary of eligible leads, the
+hidden (ineligible) and needs-review counts, the attribution-confidence mix and
+the excluded aggregates. Options `--leads-dir`, `--ledger`, `--hits-dir`,
+`--ioc`, `--attribution`, `--ss-parquet`, `--today` exist for tests.
 
 ### The digest — measuring remediation
 
-Per sector (residential/honeypot excluded): counts per status, the attribution
-confidence mix, and three distributions — **days-to-disappear** (lead
-`first_seen` → the service's last observation, for services now `gone`),
+Per sector (ineligible leads excluded): counts per status, needs-review count,
+attribution confidence mix, and three distributions — **days-to-disappear**
+(lead `first_seen` → the service's last observation, for services now `gone`),
 **notified-to-gone** (the same from `notified_on`), **still-open lead age**. A
 service that disappears is *no longer observed*: the best passive proxy for
 remediation we have, never proof of it. `--weekly` restricts the
@@ -134,25 +138,33 @@ venv/bin/python make_packet.py --org "..." --dry-run
 ```
 
 Output: `reports/packets/<org-slug>_<date>.md` (+ `.pdf`), marked **DRAFT**
-until the reviewer block is completed. Contents follow the Fletcher / Ochsner
-notices: header (TLP placeholder, reference, priority); what we observed (per
-lead: ip, port, service, evidence type, exact evidence, scan age, attribution
-basis and confidence, status); what this is not; prioritised actions generated
-from the evidence classes present (Shadowserver compromise vs exposure wording,
-ICS: "protocols typically have no authentication; reachability alone is a serious
-exposure that must be verified"); how to verify; contact/handling; reviewer
-sign-off (second reviewer **REQUIRED** when a compromise claim is present); an
-appendix of *currently active* services on the lead hosts attributed to the same
-org.
+until the reviewer block is completed (second reviewer **REQUIRED** for a
+compromise claim). Contents follow the Fletcher / Ochsner notices: header (TLP
+placeholder, reference, priority); what we observed — per lead: ip, port,
+service, evidence type, exact evidence, scan age, **exposure state** (currently
+active / stale / no longer observed with the last-observed date), attribution
+basis and confidence, status ("previously notified on <date>" for
+notified/acknowledged); a "no longer observed — historical" table for new/queued
+leads whose service is gone; what this is not; prioritised actions by evidence
+class (Shadowserver compromise vs exposure wording; ICS: "protocols typically
+have no authentication; reachability alone is a serious exposure that must be
+verified"); how to verify; contact/handling; reviewer sign-off; Appendix A.
 
-Rules: only `new`/`queued` leads by default, plus `notified`/`acknowledged`
-marked "previously notified on <date>"; closed statuses only with
-`--include-closed`; residential/honeypot leads are refused; the selected leads
-must attribute to **one** organisation or the packet is refused with the list;
-attribution is stated as recorded (registry method/confidence; Shodan org shown
-as a low-confidence label; otherwise "unattributed" — never promoted from a
-certificate name); every banner-derived string is escaped before it enters the
-markdown. Record the send with `leads.py set`.
+Refusals (all re-checked in `make_packet`, independently of `leads.py`):
+ineligible leads; leads flagged `needs_attribution_review`; leads whose host's
+**current** tier in `latest_observed` is residential/honeypot; more than one
+attributed organisation among the selected leads (listed); `--org unattributed`.
+Lead rows on one address are read in `last_evaluated` order and a disagreement
+on the owner is reported as an **attribution conflict** (never "last row
+wins"). **Cross-tenant safety:** Appendix A always lists the lead services; it
+lists *other* services on an address only when that address has whole-address
+ownership recorded for the recipient, otherwise it says "other services on this
+address omitted: shared/unresolved ownership". Attribution is stated as recorded
+(registry method/confidence; Shodan org shown as a low-confidence label; else
+"unattributed" — never promoted from a certificate name). Every external string
+(ip, port, transport, product, title, hostnames, org, evidence, dates, ids) is
+validated or escaped at the rendering boundary. Record the send with
+`leads.py set`.
 
 ## Shadowserver
 
@@ -160,20 +172,28 @@ markdown. Record the send with `leads.py set`.
 mkdir -p reference/shadowserver/incoming
 cp ~/2026-09-14-sinkhole_http_drone-louisiana.csv reference/shadowserver/incoming/
 venv/bin/python ingest_shadowserver.py ingest --dry-run
-venv/bin/python ingest_shadowserver.py ingest        # parquet + manifest, table re-published, file -> processed/
+venv/bin/python ingest_shadowserver.py ingest [--wait]   # parquet + manifest, table re-published, file -> processed/
 venv/bin/python leads.py refresh
-venv/bin/python ingest_shadowserver.py restore       # after a store rebuild (optional: refresh reads the parquet)
+venv/bin/python ingest_shadowserver.py restore           # re-create the store table after a rebuild
 # API, once keys exist in .env (SHADOWSERVER_API_KEY / SHADOWSERVER_SECRET):
 venv/bin/python ingest_shadowserver.py fetch --date 2026-09-14 [--types sinkhole_http_drone,scan_ssl]
 ```
 
-Ingest is idempotent by file sha-256 (manifest) **and** by event key; each file
-is all-or-nothing (parquet temp+rename, then manifest, then table, then move).
-Rows with surplus fields, a missing ip/timestamp, an unparseable timestamp or a
-**future** timestamp go to `reference/shadowserver/quarantine/<file>.quarantine.csv`
-with a reason; timestamps with `Z` or numeric offsets are normalised to UTC.
-`severity` is Shadowserver's own column when present, else by class. Without
-keys `fetch` explains and exits 0; a feed outage is logged, never raised.
+One `ingest` run holds `store/shadowserver/.ingest.lock` (`fcntl.flock`) from
+manifest read through dedupe, parquet publish, manifest write and input move; a
+second ingester exits cleanly with code 3 (or waits with `--wait`) and never
+proceeds without the lock. File identity is `<sha256>:<report_type>` (report
+type from the original filename, recorded in the manifest — never from the
+processed name); events dedupe on `(report_type, timestamp, ip, port, protocol,
+tag)`. Each file is all-or-nothing: parquet written to a pid-unique temp file
+and renamed, then the manifest, then the store table is re-published; if that
+publication fails the input **stays in incoming/** and is retried next run (the
+table is also re-published at the end of every run). Rows with surplus fields,
+a missing/invalid ip, a port outside 0–65535, a garbage protocol (known values
+tcp/udp/icmp; other alphabetic names become `other` with the raw value kept in
+`detail`), a missing/unparseable timestamp or a **future** timestamp go to
+`reference/shadowserver/quarantine/<file>.quarantine.csv` with a reason;
+timestamps with `Z` or numeric offsets are normalised to UTC.
 
 ### Onboarding (how the state gets reports)
 

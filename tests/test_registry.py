@@ -289,21 +289,29 @@ def test_attribution_precedence(ref_dir):
 
     # 1. OTS CIDR (/25) beats the curated /24 and /16 and any rDNS
     r = br.attribute_ip("10.0.5.1", host(hostnames=["www.lsu.edu"]), ctx)
-    assert (r["method"], r["confidence"], r["org_id"]) == ("ots_cidr", "high", "la-ots")
+    assert (r["method"], r["org_id"]) == ("ots_cidr", "la-ots")
     assert "agency=LDH" in r["evidence"] and r["org_name"] == "Louisiana Office of Technology Services"
+    # ... but a hostname of ANOTHER org on that address is a conflict: flagged, capped at medium
+    assert (r["confidence"], r["conflict"]) == ("medium", "prefix=la-ots;rdns=la-lsu")
+    r = br.attribute_ip("10.0.5.2", host(), ctx)
+    assert (r["confidence"], r["conflict"]) == ("high", "")
     # 2. curated /24 beats /16 (longest prefix) and beats rDNS
     r = br.attribute_ip("10.0.5.200", host(hostnames=["www.lsu.edu"]), ctx)
     assert (r["method"], r["org_id"], r["evidence"]) == ("registry_network", "la-nola", "prefix 10.0.5.0/24 (curated)")
+    assert (r["confidence"], r["conflict"]) == ("medium", "prefix=la-nola;rdns=la-lsu")
     r = br.attribute_ip("10.0.9.1", host(), ctx)
-    assert (r["method"], r["org_id"]) == ("registry_network", "la-lsu")
+    assert (r["method"], r["org_id"], r["confidence"]) == ("registry_network", "la-lsu", "high")
     # 3. rDNS under a registry domain beats cert and ASN; label boundary holds
     r = br.attribute_ip("198.51.100.1", host(hostnames=["vpn.nola.gov"], cert_names=["x.ochsner.org"]), ctx)
-    assert (r["method"], r["confidence"], r["org_id"]) == ("domain_dns", "high", "la-nola")
-    assert r["evidence"] == "rDNS vpn.nola.gov under nola.gov"
+    assert (r["method"], r["org_id"], r["evidence"]) == ("domain_dns", "la-nola", "rDNS vpn.nola.gov under nola.gov")
+    # rDNS and certificate disagree -> structured conflict, medium
+    assert (r["confidence"], r["conflict"]) == ("medium", "rdns=la-nola;cert=la-ochsner")
+    r = br.attribute_ip("198.51.100.1", host(hostnames=["vpn.nola.gov"], cert_names=["x.nola.gov"]), ctx)
+    assert (r["confidence"], r["conflict"]) == ("high", "")
     # two orgs' names on one IP: the org with more names wins, but only at MEDIUM,
-    # and the competitor is named
+    # and the competitor is named in both evidence and conflict
     r = br.attribute_ip("198.51.100.1", host(hostnames=["a.nola.gov", "b.nola.gov", "x.ochsner.org"]), ctx)
-    assert (r["org_id"], r["confidence"]) == ("la-nola", "medium")
+    assert (r["org_id"], r["confidence"], r["conflict"]) == ("la-nola", "medium", "rdns=la-nola,la-ochsner")
     assert r["evidence"] == "rDNS a.nola.gov under nola.gov; SHARED IP: names of la-ochsner also present"
     r = br.attribute_ip("198.51.100.1", host(hostnames=["evilnola.gov"], cert_names=["x.ochsner.org"]), ctx)
     assert (r["method"], r["org_id"]) == ("cert", "la-ochsner")
@@ -492,8 +500,8 @@ def test_cymru_candidates_exclude_residential(ref_dir, tmp_path, monkeypatch):
     # and main() really passes only those to fill_cymru
     sent = []
     monkeypatch.setattr(br, "read_hosts", lambda db, limit=None: hosts)
-    monkeypatch.setattr(br, "fill_cymru", lambda cache, ips, today, network=True: sent.append(list(ips)) or {})
-    monkeypatch.setattr(br, "fill_rdap", lambda cache, asns, today, network=True: {})
+    monkeypatch.setattr(br, "fill_cymru", lambda cache, ips, today, network=True, **kw: sent.append(list(ips)) or {})
+    monkeypatch.setattr(br, "fill_rdap", lambda cache, asns, today, network=True, **kw: {})
     real_load = br.load_registry_csvs
     monkeypatch.setattr(br, "load_registry_csvs", lambda: real_load(ref_dir))
     monkeypatch.setattr(br, "load_rosters", lambda: {})
@@ -523,17 +531,20 @@ def test_unreadable_store_keeps_previous_attribution(ref_dir, tmp_path, monkeypa
     monkeypatch.setattr(sys, "argv", ["build_registry.py", "--skip-network", "--out", str(out)])
     assert br.main() == 0
     att = rg.Attributor().load(str(out))
-    assert att.lookup("203.0.113.9")["evidence"] == "old"          # previous file untouched
+    assert att.lookup("203.0.113.9")["evidence"] == "old"          # previous rows carried forward
     assert len(att.orgs) == 5                                      # registry tables still refreshed
+    assert att.generation != str(out) and os.path.basename(att.generation).startswith("gen-")
     assert not [p for p in os.listdir(out) if p.endswith(".tmp")]
 
 
 def test_write_generation_is_all_or_nothing(tmp_path, monkeypatch):
+    from datetime import datetime as dt
     out = tmp_path / "registry"
     orgs = [{"org_id": "x", "name": "X"}]
-    br.write_generation(str(out), {"registry_orgs.parquet": (orgs, rg.ORG_COLS),
-                                   "ip_attribution.parquet": ([], rg.ATTR_COLS)})
-    before = {p: os.path.getmtime(out / p) for p in os.listdir(out)}
+    gen1 = br.write_generation(str(out), {"registry_orgs.parquet": (orgs, rg.ORG_COLS),
+                                          "ip_attribution.parquet": ([], rg.ATTR_COLS)},
+                               now=dt(2026, 9, 15, 1, 0, 0))
+    assert open(out / "CURRENT").read().strip() == "gen-20260915T010000"
     real = br.write_parquet
     calls = []
 
@@ -546,8 +557,135 @@ def test_write_generation_is_all_or_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(br, "write_parquet", flaky)
     with pytest.raises(RuntimeError):
         br.write_generation(str(out), {"registry_orgs.parquet": ([], rg.ORG_COLS),
-                                       "ip_attribution.parquet": ([], rg.ATTR_COLS)})
-    assert {p: os.path.getmtime(out / p) for p in os.listdir(out)} == before   # nothing replaced, no .tmp left
+                                       "ip_attribution.parquet": ([], rg.ATTR_COLS)},
+                            now=dt(2026, 9, 15, 2, 0, 0))
+    assert open(out / "CURRENT").read().strip() == "gen-20260915T010000"     # pointer untouched
+    assert sorted(d for d in os.listdir(out) if d.startswith("gen-")) == ["gen-20260915T010000"]
+    assert rg.resolve_generation(str(out)) == gen1
+
+
+# --- second review pass: conflicts, generations, stale evidence, newest tier ----
+
+def test_duplicate_domain_conflict_is_flagged(ref_dir):
+    orgs, nets, doms = br.load_registry_csvs(ref_dir)
+    dup = {"domain": "nola.gov", "org_id": "la-lsu", "source": "dup", "confidence": "high", "as_of": AS_OF}
+    ctx = br.build_context(orgs, nets, doms + [dup], {}, {}, AS_OF)
+    r = br.attribute_ip("203.0.113.20", host(hostnames=["www.nola.gov"]), ctx)
+    assert (r["org_id"], r["confidence"], r["conflict"]) == ("la-nola", "medium", "duplicate domain nola.gov: la-nola vs la-lsu")
+    ots = [{"prefix": "10.0.5.0/24", "asn": "", "org_id": "la-ots", "source": "ots_cidrs",
+            "confidence": "high", "as_of": AS_OF, "agency": "", "contact": ""}]
+    ctx = br.build_context(orgs, ots + nets, doms, {}, {}, AS_OF)
+    r = br.attribute_ip("10.0.5.7", host(), ctx)
+    assert (r["method"], r["org_id"], r["confidence"]) == ("ots_cidr", "la-ots", "medium")
+    assert r["conflict"] == "duplicate prefix 10.0.5.0/24: la-ots vs la-nola"
+    # a MORE SPECIFIC curated prefix still wins by longest-prefix, without conflict
+    ctx = br.build_context(orgs, [{"prefix": "10.0.0.0/8", "asn": "", "org_id": "la-ots", "source": "ots_cidrs",
+                                   "confidence": "high", "as_of": AS_OF}] + nets, doms, {}, {}, AS_OF)
+    r = br.attribute_ip("10.0.5.7", host(), ctx)
+    assert (r["method"], r["org_id"], r["confidence"], r["conflict"]) == ("registry_network", "la-nola", "high", "")
+
+
+def test_generation_pointer_load_fallback_and_pruning(tmp_path, capsys):
+    from datetime import datetime as dt
+    out = tmp_path / "registry"
+    orgs = [{"org_id": "la-x", "name": "X Org", "sector": "government", "jurisdiction": "state"}]
+    attr = [{"ip": "203.0.113.1", "org_id": "la-x", "org_name": "X Org", "sector": "government",
+             "jurisdiction": "state", "method": "domain_dns", "confidence": "high", "evidence": "e",
+             "as_of": "2026-09-10", "conflict": ""}]
+    for i in range(4):
+        br.write_generation(str(out), {"registry_orgs.parquet": (orgs, rg.ORG_COLS),
+                                       "ip_attribution.parquet": (attr, rg.ATTR_COLS)},
+                            now=dt(2026, 9, 15, 0, 0, i))
+    gens = sorted(d for d in os.listdir(out) if d.startswith("gen-"))
+    assert gens == ["gen-20260915T000001", "gen-20260915T000002", "gen-20260915T000003"]   # last 3 kept
+    att = rg.Attributor().load(str(out))
+    assert os.path.basename(att.generation) == "gen-20260915T000003"
+    assert att.lookup("203.0.113.1")["org_id"] == "la-x" and att.attribution_as_of == "2026-09-10"
+    out_txt = capsys.readouterr().out
+    assert "registry_networks.parquet missing — loaded empty" in out_txt and "loaded 1 orgs" in out_txt
+    # pointer to a vanished generation -> flat-file fallback (compatibility)
+    (out / "CURRENT").write_text("gen-doesnotexist\n")
+    import duckdb
+    con = duckdb.connect()
+    br.write_parquet(con, attr[:1], rg.ATTR_COLS, str(out / "ip_attribution.parquet"))
+    con.close()
+    att = rg.Attributor().load(str(out))
+    assert att.generation == str(out) and att.lookup("203.0.113.1")["method"] == "domain_dns"
+    assert att.lookup("203.0.113.1")["conflict"] == ""
+    (out / "CURRENT").unlink()
+    assert rg.resolve_generation(str(out)) == str(out)
+
+
+def test_stale_cymru_record_kept_when_network_fails(ref_dir, tmp_path):
+    cache = br.JsonCache(str(tmp_path / "cymru.json"), 30)
+    cache.put("198.51.100.1", {"asn": "AS63103", "as_name": "OCF-AS, US", "prefix": "198.51.100.0/24"},
+              date(2026, 1, 1))                                     # long expired
+    status = {}
+
+    def down(ips):
+        raise OSError("network unreachable")
+
+    got = br.fill_cymru(cache, ["198.51.100.1"], TODAY, network=True, query=down, status=status)
+    assert status == {"attempted": 1, "failed": 1}
+    assert got["198.51.100.1"]["asn"] == "AS63103" and got["198.51.100.1"]["stale"] is True
+    assert got["198.51.100.1"]["stale_as_of"] == "2026-01-01"
+    ctx = make_ctx(ref_dir, got)
+    r = br.attribute_ip("198.51.100.1", host(), ctx)
+    assert (r["method"], r["org_id"], r["confidence"]) == ("registry_asn", "la-ochsner", "medium")
+    assert "(stale as_of 2026-01-01)" in r["evidence"]
+    # fresher data replaces the stale record
+    fresh = lambda ips: "\n".join(f"2055 | {ip} | 10.0.0.0/8 | US | arin | 2000-01-01 | LSU, US" for ip in ips)
+    got = br.fill_cymru(cache, ["198.51.100.1"], TODAY, network=True, query=fresh, status=status)
+    assert got["198.51.100.1"]["asn"] == "AS2055" and "stale" not in got["198.51.100.1"]
+    # RDAP: the last good record survives an outage, marked stale
+    rc = br.JsonCache(str(tmp_path / "rdap.json"), 90)
+    rc.put("AS10349", br.parse_rdap_autnum(RDAP_DOC), date(2026, 1, 1))
+    got = br.fill_rdap(rc, ["AS10349"], TODAY, fetch=lambda a: (_ for _ in ()).throw(OSError("503")),
+                       sleep=lambda s: None, status=status)
+    assert got["AS10349"]["org_name"] == "Tulane University" and got["AS10349"]["stale"] is True
+    assert rc.get("AS10349")["prev"]["org_name"] == "Tulane University"
+
+
+def test_keep_stronger_previous_rows_on_outage():
+    new = [{"ip": "1.1.1.1", "org_id": "", "confidence": "low", "evidence": "AS1", "method": "shodan_asn",
+            "org_name": "", "sector": "", "jurisdiction": "", "as_of": AS_OF, "conflict": ""},
+           {"ip": "1.1.1.2", "org_id": "la-x", "confidence": "high", "evidence": "prefix", "method": "registry_network",
+            "org_name": "X", "sector": "", "jurisdiction": "", "as_of": AS_OF, "conflict": ""}]
+    prev = {"1.1.1.1": {"ip": "1.1.1.1", "org_id": "la-y", "confidence": "medium", "evidence": "rdap",
+                        "method": "arin_rdap", "org_name": "Y", "sector": "", "jurisdiction": "",
+                        "as_of": "2026-09-10", "conflict": None},
+            "1.1.1.2": {"ip": "1.1.1.2", "org_id": "", "confidence": "low", "evidence": "x",
+                        "method": "cymru_asn", "as_of": "2026-09-10"}}
+    assert br.keep_stronger_previous(new, prev, "Cymru down") == 1
+    assert new[0]["org_id"] == "la-y" and new[0]["confidence"] == "medium" and new[0]["conflict"] == ""
+    assert new[0]["evidence"] == "rdap (kept from previous build as_of 2026-09-10: Cymru down)"
+    assert new[1]["org_id"] == "la-x"                       # the stronger new row is kept
+
+
+def test_read_hosts_uses_newest_observation_for_tier(tmp_path):
+    import duckdb
+    store = tmp_path / "store"
+    con = duckdb.connect()
+    rows = [("2026-09-01", "203.0.113.5", 80, "tcp", "2026-09-01 01:00:00", "obs-a", "AS22773", "Cox Communications",
+             "residential", "old.example.net", "", "", "", ""),
+            ("2026-09-02", "203.0.113.5", 443, "tcp", "2026-09-02 01:00:00", "obs-b", "AS2055", "Louisiana State University",
+             "education", "www.lsu.edu", "", "www.lsu.edu", "www.lsu.edu", "Louisiana State University")]
+    for r in rows:
+        part = store / "observations" / f"date={r[0]}"
+        part.mkdir(parents=True)
+        con.execute("CREATE OR REPLACE TABLE t (date DATE, ip VARCHAR, port INTEGER, transport VARCHAR, "
+                    "banner_ts TIMESTAMP, observation_id VARCHAR, asn VARCHAR, org VARCHAR, tier VARCHAR, "
+                    "hostnames VARCHAR, tags VARCHAR, cert_sans VARCHAR, cert_cn VARCHAR, cert_org VARCHAR)")
+        con.execute("INSERT INTO t VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", list(r))
+        con.execute(f"COPY t TO '{part / 'data.parquet'}' (FORMAT PARQUET)")
+    con.close()
+    hosts = br.read_hosts(str(store / "exposure.duckdb"))         # no db file -> partition fallback
+    h = hosts["203.0.113.5"]
+    assert (h["tier"], h["asn"], h["org"]) == ("education", "AS2055", "Louisiana State University")
+    assert h["hostnames"] == ["old.example.net", "www.lsu.edu"]     # names unioned over all ports
+    assert h["cert_names"] == ["www.lsu.edu"] and h["cert_orgs"] == ["Louisiana State University"]
+    assert br.cymru_candidates(hosts) == ["203.0.113.5"]           # newest tier is not residential
+    assert br.read_hosts(str(tmp_path / "nowhere" / "exposure.duckdb")) is None
 
 
 def test_attributor_is_fast_enough(ref_dir, tmp_path):

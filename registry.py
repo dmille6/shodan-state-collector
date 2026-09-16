@@ -36,7 +36,25 @@ ORG_COLS = ["org_id", "name", "sector", "jurisdiction", "aliases", "domains",
 NET_COLS = ["prefix", "asn", "org_id", "source", "confidence", "as_of"]
 DOM_COLS = ["domain", "org_id", "source", "confidence", "as_of"]
 ATTR_COLS = ["ip", "org_id", "org_name", "sector", "jurisdiction", "method",
-             "confidence", "evidence", "as_of"]
+             "confidence", "evidence", "as_of", "conflict"]
+# conflict: '' or a structured note when evidence disagrees ('rdns=la-x;cert=la-y',
+# 'duplicate domain foo.org: la-a vs la-b'); confidence is then at most medium.
+CURRENT_POINTER = "CURRENT"      # store/registry/CURRENT names the live gen-<ts> directory
+REGISTRY_FILES = ["registry_orgs.parquet", "registry_networks.parquet",
+                  "registry_domains.parquet", "ip_attribution.parquet"]
+
+
+def resolve_generation(store_dir):
+    """Directory holding the live parquet files: the generation named by the
+    CURRENT pointer file when it exists and points at a real directory, else
+    `store_dir` itself (flat layout, for compatibility)."""
+    pointer = os.path.join(store_dir, CURRENT_POINTER)
+    try:
+        name = open(pointer).read().strip()
+    except OSError:
+        return store_dir
+    gen = os.path.join(store_dir, os.path.basename(name))
+    return gen if name and os.path.isdir(gen) else store_dir
 SECTORS = {"critical_infrastructure", "government", "education", "healthcare", "energy",
            "water", "telecom", "finance", "small_business", "out_of_state", "other"}
 JURISDICTIONS = {"state", "parish", "municipal", "federal", "private", "out_of_state"}
@@ -262,24 +280,41 @@ class Attributor:
         self.networks = PrefixTable()  # prefix -> network row
         self.domains = DomainTable()   # domain -> domain row
         self.attribution = {}          # ip -> ip_attribution row
-        self.store_dir = None
+        self.store_dir = None          # store/registry (holds CURRENT + gen-* dirs)
+        self.generation = None         # directory the files were actually read from
+        self.attribution_as_of = ""    # newest as_of in ip_attribution ('' when empty)
 
     def load(self, store_dir=None):
+        """Read the live generation (CURRENT pointer, else flat files) into
+        memory. A missing file is logged to stdout and loaded as empty — never
+        an exception — so a store without a registry yet still runs."""
         import duckdb
         self.store_dir = store_dir or REGISTRY_STORE
+        self.generation = resolve_generation(self.store_dir)
         con = duckdb.connect()
         try:
-            for o in _read_parquet(con, os.path.join(self.store_dir, "registry_orgs.parquet")):
-                self.orgs[o["org_id"]] = o
-            for n in _read_parquet(con, os.path.join(self.store_dir, "registry_networks.parquet")):
-                if n.get("prefix"):
-                    self.networks.add(n["prefix"], n)
-            for d in _read_parquet(con, os.path.join(self.store_dir, "registry_domains.parquet")):
-                self.domains.add(d["domain"], d)
-            for a in _read_parquet(con, os.path.join(self.store_dir, "ip_attribution.parquet")):
-                self.attribution[a["ip"]] = a
+            tables = []
+            for name in REGISTRY_FILES:
+                path = os.path.join(self.generation, name)
+                if not os.path.isfile(path):
+                    print(f"registry: {path} missing — loaded empty", flush=True)
+                tables.append(_read_parquet(con, path))
         finally:
             con.close()
+        orgs, nets, doms, attr = tables
+        for o in orgs:
+            self.orgs[o["org_id"]] = o
+        for n in nets:
+            if n.get("prefix"):
+                self.networks.add(n["prefix"], n)
+        for d in doms:
+            self.domains.add(d["domain"], d)
+        for a in attr:
+            self.attribution[a["ip"]] = a
+        self.attribution_as_of = max((str(a.get("as_of") or "") for a in attr), default="")
+        print(f"registry: loaded {len(self.orgs)} orgs, {len(self.networks)} prefixes, "
+              f"{len(self.domains)} domains, {len(self.attribution):,} attributed IPs "
+              f"(as_of {self.attribution_as_of or 'n/a'}) from {self.generation}", flush=True)
         return self
 
     def org(self, org_id):
@@ -301,6 +336,7 @@ class Attributor:
             "confidence": row.get("confidence") or "high",
             "evidence": f"prefix {prefix} ({src})" + (f" agency={row['agency']}" if row.get("agency") else ""),
             "as_of": str(row.get("as_of") or ""),
+            "conflict": "",
         }
 
     def lookup(self, ip):
