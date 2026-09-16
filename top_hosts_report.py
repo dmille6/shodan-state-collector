@@ -50,9 +50,10 @@ ICS_PORTS = "(502,20000,47808,102,44818,1911,2404,789,1962,9600,20547)"
 SQL = f"""
 WITH hosts AS (
   SELECT cs.ip,
-         any_value(cs.tier) AS tier, any_value(cs.org) AS org, any_value(cs.city) AS city,
-         any_value(cs.asn) AS asn, any_value(cs.attr_org_name) AS attr_org,
-         any_value(cs.attr_method) AS attr_method, any_value(cs.attr_confidence) AS attr_conf,
+         -- newest observation's values, so membership is deterministic run to run
+         arg_max(cs.tier, cs.date) AS tier, arg_max(cs.org, cs.date) AS org, arg_max(cs.city, cs.date) AS city,
+         arg_max(cs.asn, cs.date) AS asn, arg_max(cs.attr_org_name, cs.date) AS attr_org,
+         arg_max(cs.attr_method, cs.date) AS attr_method, arg_max(cs.attr_confidence, cs.date) AS attr_conf,
          count(*) AS services,
          list(DISTINCT cs.port ORDER BY cs.port) AS ports,
          string_agg(DISTINCT coalesce(cs.product,''), ',') AS products,
