@@ -646,20 +646,95 @@ def test_stale_cymru_record_kept_when_network_fails(ref_dir, tmp_path):
     assert rc.get("AS10349")["prev"]["org_name"] == "Tulane University"
 
 
-def test_keep_stronger_previous_rows_on_outage():
-    new = [{"ip": "1.1.1.1", "org_id": "", "confidence": "low", "evidence": "AS1", "method": "shodan_asn",
-            "org_name": "", "sector": "", "jurisdiction": "", "as_of": AS_OF, "conflict": ""},
-           {"ip": "1.1.1.2", "org_id": "la-x", "confidence": "high", "evidence": "prefix", "method": "registry_network",
-            "org_name": "X", "sector": "", "jurisdiction": "", "as_of": AS_OF, "conflict": ""}]
-    prev = {"1.1.1.1": {"ip": "1.1.1.1", "org_id": "la-y", "confidence": "medium", "evidence": "rdap",
-                        "method": "arin_rdap", "org_name": "Y", "sector": "", "jurisdiction": "",
-                        "as_of": "2026-09-10", "conflict": None},
-            "1.1.1.2": {"ip": "1.1.1.2", "org_id": "", "confidence": "low", "evidence": "x",
-                        "method": "cymru_asn", "as_of": "2026-09-10"}}
-    assert br.keep_stronger_previous(new, prev, "Cymru down") == 1
-    assert new[0]["org_id"] == "la-y" and new[0]["confidence"] == "medium" and new[0]["conflict"] == ""
+def _arow(ip, org_id, method, conf, evidence="e", as_of=AS_OF, conflict=""):
+    return {"ip": ip, "org_id": org_id, "org_name": org_id.upper(), "sector": "", "jurisdiction": "",
+            "method": method, "confidence": conf, "evidence": evidence, "as_of": as_of, "conflict": conflict}
+
+
+def test_keep_stronger_previous_only_restores_lost_network_evidence():
+    orgs = {"la-x", "la-y"}
+    prev = {"1.1.1.1": _arow("1.1.1.1", "la-y", "arin_rdap", "medium", "rdap", "2026-09-10"),
+            "1.1.1.2": _arow("1.1.1.2", "", "cymru_asn", "low", "x", "2026-09-10"),
+            "1.1.1.3": _arow("1.1.1.3", "la-y", "registry_asn", "medium", "asn", "2026-09-10"),
+            "1.1.1.4": _arow("1.1.1.4", "la-y", "registry_asn", "medium", "asn", "2026-09-10"),
+            "1.1.1.5": _arow("1.1.1.5", "la-gone", "arin_rdap", "medium", "rdap", "2026-09-10"),
+            "1.1.1.6": _arow("1.1.1.6", "la-y", "domain_dns", "high", "rdns", "2026-09-10"),
+            "1.1.1.7": _arow("1.1.1.7", "la-y", "registry_asn", "medium", "asn", "2026-09-10")}
+    new = [_arow("1.1.1.1", "", "shodan_asn", "low", "AS1"),                      # restored
+           _arow("1.1.1.2", "la-x", "registry_network", "high", "prefix"),          # stronger: kept
+           _arow("1.1.1.3", "", "shodan_asn", "low", "AS1", conflict="rdns=la-a;cert=la-b"),  # conflict: never erased
+           _arow("1.1.1.4", "la-x", "shodan_asn", "low", "AS1"),                   # different org: kept
+           _arow("1.1.1.5", "", "shodan_asn", "low", "AS1"),                       # previous org revoked
+           _arow("1.1.1.6", "", "shodan_asn", "low", "AS1"),                       # prev evidence was names, not network
+           _arow("1.1.1.7", "la-y", "none", "low", "nothing")]                     # same org, network fallback: restored
+    assert br.keep_stronger_previous(new, prev, "Cymru down", orgs) == 2
+    assert new[0]["org_id"] == "la-y" and new[0]["confidence"] == "medium"
     assert new[0]["evidence"] == "rdap (kept from previous build as_of 2026-09-10: Cymru down)"
-    assert new[1]["org_id"] == "la-x"                       # the stronger new row is kept
+    assert new[1]["org_id"] == "la-x" and new[1]["confidence"] == "high"
+    assert new[2]["conflict"] == "rdns=la-a;cert=la-b" and new[2]["org_id"] == ""
+    assert new[3]["org_id"] == "la-x" and new[3]["method"] == "shodan_asn"
+    assert new[4]["org_id"] == "" and new[5]["org_id"] == ""
+    assert new[6]["org_id"] == "la-y" and new[6]["method"] == "registry_asn"
+
+
+def test_lookup_keeps_build_time_conflict_on_live_prefix_hit(ref_dir, tmp_path):
+    import duckdb
+    orgs, nets, doms = br.load_registry_csvs(ref_dir)
+    rows = [dict(_arow("10.0.5.9", "la-nola", "registry_network", "high", "prefix 10.0.5.0/24 (curated)"),
+                 conflict="rdns=la-nola;cert=la-lsu"),
+            _arow("10.0.5.10", "la-lsu", "registry_network", "high", "prefix (older networks.csv)"),
+            _arow("10.0.5.11", "la-nola", "registry_network", "high", "prefix 10.0.5.0/24 (curated)"),
+            dict(_arow("10.0.5.12", "la-lsu", "domain_dns", "medium", "rDNS x.lsu.edu"), conflict="rdns=la-lsu,la-nola")]
+    out = str(tmp_path / "out")
+    br.write_generation(out, {"registry_orgs.parquet": (orgs, rg.ORG_COLS),
+                              "registry_networks.parquet": (nets, rg.NET_COLS + ["agency", "contact"]),
+                              "registry_domains.parquet": (doms, rg.DOM_COLS),
+                              "ip_attribution.parquet": (rows, rg.ATTR_COLS)})
+    att = rg.Attributor().load(out)
+    r = att.lookup("10.0.5.9")                       # live prefix hit + built conflict -> carried, medium
+    assert (r["method"], r["org_id"], r["confidence"], r["conflict"]) == ("registry_network", "la-nola", "medium", "rdns=la-nola;cert=la-lsu")
+    r = att.lookup("10.0.5.10")                      # build said la-lsu by prefix, live prefix says la-nola
+    assert (r["org_id"], r["confidence"], r["conflict"]) == ("la-nola", "medium", "live_prefix=la-nola;built_prefix=la-lsu")
+    r = att.lookup("10.0.5.11")                      # agreement: clean high
+    assert (r["org_id"], r["confidence"], r["conflict"]) == ("la-nola", "high", "")
+    r = att.lookup("10.0.5.12")                      # a name-based built row under the live prefix keeps its conflict
+    assert (r["org_id"], r["confidence"]) == ("la-nola", "medium") and r["conflict"] == "rdns=la-lsu,la-nola"
+
+
+def test_csv_duplicate_domain_and_prefix_flag_per_ip_conflict(ref_dir, capsys):
+    with open(os.path.join(ref_dir, "orgs.csv")) as fh:
+        txt = fh.read().replace("lsu.edu;lsuagcenter.com", "lsu.edu;lsuagcenter.com;nola.gov")
+    with open(os.path.join(ref_dir, "orgs.csv"), "w") as fh:
+        fh.write(txt)
+    with open(os.path.join(ref_dir, "networks.csv"), "a") as fh:
+        fh.write("10.0.5.0/24,,la-lsu,curated,high,2026-09-15\n")
+    orgs, nets, doms = br.load_registry_csvs(ref_dir)
+    assert [d["org_id"] for d in doms if d["domain"] == "nola.gov"] == ["la-nola", "la-lsu"]   # both kept, first wins
+    assert "domains: nola.gov is listed for la-nola, la-lsu" in capsys.readouterr().out
+    ctx = br.build_context(orgs, nets, doms, {}, {}, AS_OF)
+    assert ctx["dups"]["domain"] == {"nola.gov": "la-nola vs la-lsu"}
+    assert ctx["dups"]["prefix"] == {"10.0.5.0/24": "la-nola vs la-lsu"}
+    r = br.attribute_ip("203.0.113.30", host(hostnames=["www.nola.gov"]), ctx)
+    assert (r["org_id"], r["confidence"], r["conflict"]) == ("la-nola", "medium", "duplicate domain nola.gov: la-nola vs la-lsu")
+    r = br.attribute_ip("10.0.5.30", host(), ctx)
+    assert (r["org_id"], r["confidence"], r["conflict"]) == ("la-nola", "medium", "duplicate prefix 10.0.5.0/24: la-nola vs la-lsu")
+    r = br.attribute_ip("203.0.113.31", host(hostnames=["www.lsu.edu"]), ctx)
+    assert (r["confidence"], r["conflict"]) == ("high", "")
+
+
+def test_build_lock_makes_second_run_exit_cleanly(tmp_path, monkeypatch, capsys):
+    import fcntl
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(sys, "argv", ["build_registry.py", "--dry-run", "--skip-network", "--out", str(out)])
+    monkeypatch.setattr(br, "build", lambda args: 7)
+    holder = open(out / br.BUILD_LOCK, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert br.main() == 0                                   # lock held elsewhere: clean exit, no build
+    assert "holds" in capsys.readouterr().out
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+    assert br.main() == 7                                   # lock free: build runs
 
 
 def test_read_hosts_uses_newest_observation_for_tier(tmp_path):

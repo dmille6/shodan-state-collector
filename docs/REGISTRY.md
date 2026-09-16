@@ -186,9 +186,23 @@ leaves the pointer untouched and removes its half-built directory.
 - **Network source down**: an expired cache record is still used when it could
   not be refreshed — evidence carries `(stale as_of <date>)` — and is replaced
   only by fresher data (RDAP keeps the last *good* record beside the error).
-  If Cymru or RDAP could not be reached at all, every IP whose new row would be
-  weaker than its row in the previous generation keeps the previous row
-  (evidence: `(kept from previous build as_of …: <reason>)`).
+  If Cymru or RDAP could not be reached at all, an IP keeps its previous
+  generation's row (evidence: `(kept from previous build as_of …: <reason>)`)
+  **only** when the new row is weaker purely for lack of that network
+  evidence: no `conflict` on the new row, same org (or none), the new method is
+  a network fallback (`cymru_asn` / `shodan_asn` / `none`) while the previous
+  row's method depended on Cymru/RDAP (`registry_asn` / `arin_rdap` /
+  `cymru_asn`), and the previous org still exists in `orgs.csv`. A new conflict,
+  an ownership change, a name- or prefix-based new row, or a revoked org is
+  never overwritten by old data.
+- **Live-prefix lookups keep build-time conflicts**: `Attributor.lookup()`
+  prefers a live prefix hit, but merges the precomputed row's `conflict` into it
+  (confidence capped at medium), and treats a build-time prefix attribution to a
+  different org than the live prefix as a conflict
+  (`live_prefix=la-a;built_prefix=la-b`).
+- **One writer at a time**: `build_registry.py` holds an exclusive `flock` on
+  `store/registry/.build.lock` for the whole build and exits cleanly (code 0,
+  logged) if another build holds it; every temp file name carries the pid.
 - `Attributor.load()` prints where it loaded from, logs every missing file
   (`… missing — loaded empty`), and exposes `attribution_as_of` (the newest
   `as_of` in `ip_attribution`) for reports to print.

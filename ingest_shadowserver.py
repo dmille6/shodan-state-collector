@@ -51,6 +51,11 @@ contact at the owning organisation; (3) Shadowserver verifies ownership (RIR / L
 and starts daily e-mail reports; (4) request API access, put key/secret in .env;
 (5) cron `fetch --date <yesterday>` + `ingest` + `leads.py refresh` after the census.
 
+Exit codes: 0 ok, 3 another ingest holds the lock, 4 DEGRADED (a file errored /
+could not be published, or the final store republish failed — the parquet and
+manifest are authoritative and intact; run_nightly should mark the night degraded).
+IPs are canonicalised (ipaddress ... .compressed) so IPv6 spellings match the store.
+
 Usage:
     ingest_shadowserver.py ingest [--dry-run] [--incoming DIR] [--db PATH]
     ingest_shadowserver.py restore [--db PATH]            # after a store rebuild
@@ -196,7 +201,7 @@ def parse_report(path, today=None):
             if not ip:
                 bad.append(("missing ip", row)); continue
             try:
-                ipaddress.ip_address(ip)
+                ip = ipaddress.ip_address(ip).compressed          # canonical spelling (IPv6 too)
             except ValueError:
                 bad.append(("invalid ip", row)); continue
             if not row.get("timestamp"):
@@ -402,7 +407,8 @@ def ingest_dir(con, incoming=INCOMING, today=None, dry_run=False, processed_dir=
         if not files:
             log(f"no CSV files under {incoming}")
         if not dry_run and con is not None and os.path.exists(parquet):
-            restore_table(con, parquet)          # the store copy is republished every run
+            if not restore_table(con, parquet):   # the store copy is republished every run
+                totals["_republish_failed"] = 1
         return totals
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -530,6 +536,10 @@ def main(argv=None):
         if totals is None:
             return 3
         log("ingest summary: " + (", ".join(f"{k}={v}" for k, v in totals.items()) or "nothing to do"))
+        if totals.get("error") or totals.get("unpublished") or totals.get("_republish_failed"):
+            log("ingest DEGRADED: authoritative parquet/manifest are fine but a file errored or the store copy was "
+                "not published (exit 4)")
+            return 4
         return 0
     if args.cmd == "restore":
         con = _open_store(args.db)

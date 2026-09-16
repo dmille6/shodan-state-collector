@@ -33,6 +33,7 @@ Usage:
 """
 import argparse
 import csv
+import fcntl
 import glob
 import ipaddress
 import json
@@ -90,27 +91,29 @@ def load_registry_csvs(ref_dir=rg.REGISTRY_REF):
     orgs = rg.load_orgs(os.path.join(ref_dir, "orgs.csv"))
     networks = rg.load_networks(os.path.join(ref_dir, "networks.csv"))
     domains = rg.load_domains(os.path.join(ref_dir, "domains.csv"))
-    # Duplicate domains: the FIRST row wins (domains.csv order, then orgs.csv);
-    # a duplicate pointing at another org is logged as a conflict and dropped.
+    # Duplicate domains: a repeat for the SAME org carries no information and is
+    # dropped; a repeat naming a DIFFERENT org is kept in row order (the first
+    # row wins downstream) so build_context can record the conflict and every
+    # IP it touches gets a `conflict` note. Order: domains.csv, then orgs.csv.
     known, unique = {}, []
     for d in domains:
-        if d["domain"] in known:
-            if known[d["domain"]] != d["org_id"]:
-                log(f"domains.csv: {d['domain']} listed for {known[d['domain']]} and {d['org_id']}; "
-                    f"keeping the first ({known[d['domain']]})")
+        owners = known.setdefault(d["domain"], [])
+        if d["org_id"] in owners:
             continue
-        known[d["domain"]] = d["org_id"]
+        owners.append(d["org_id"])
         unique.append(d)
     domains = unique
     for o in orgs:
         for d in rg.split_multi(o["domains"], ";"):
-            if d in known:
-                if known[d] != o["org_id"]:
-                    log(f"orgs.csv: {o['org_id']} lists {d}, already owned by {known[d]} in domains.csv; ignored")
+            owners = known.setdefault(d, [])
+            if o["org_id"] in owners:
                 continue
+            owners.append(o["org_id"])
             domains.append({"domain": d, "org_id": o["org_id"], "source": "orgs.csv",
                             "confidence": "high", "as_of": o["as_of"]})
-            known[d] = o["org_id"]
+    for d, owners in known.items():
+        if len(owners) > 1:
+            log(f"domains: {d} is listed for {', '.join(owners)}; the first wins, IPs under it will carry a conflict")
     by_id = {o["org_id"]: o for o in orgs}
     for row in networks + domains:
         if row["org_id"] and row["org_id"] not in by_id:
@@ -306,8 +309,9 @@ class JsonCache:
 
     def save(self, today):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
-        json.dump({"as_of": today.isoformat(), "entries": self.entries}, open(tmp, "w"))
+        tmp = f"{self.path}.{os.getpid()}.tmp"          # pid-unique: two writers never share a temp
+        with open(tmp, "w") as fh:
+            json.dump({"as_of": today.isoformat(), "entries": self.entries}, fh)
         os.replace(tmp, self.path)
 
 
@@ -757,7 +761,7 @@ def write_parquet(con, rows, cols, out_path, stage=None):
             tmp.write(json.dumps({c: ("" if r.get(c) is None else str(r.get(c))) for c in cols}) + "\n")
         tmp.close()
         sel = ", ".join(f"CAST({c} AS VARCHAR) AS {c}" for c in cols)
-        out_tmp = stage or (out_path + ".tmp")
+        out_tmp = stage or f"{out_path}.{os.getpid()}.tmp"
         if rows:
             con.execute(f"COPY (SELECT {sel} FROM read_json_auto('{tmp.name}', "
                         f"format='newline_delimited') ) TO '{out_tmp}' (FORMAT PARQUET)")
@@ -809,9 +813,10 @@ def write_generation(out_dir, tables, carry=(), keep=KEEP_GENERATIONS, now=None)
     finally:
         con.close()
     pointer = os.path.join(out_dir, rg.CURRENT_POINTER)
-    with open(pointer + ".tmp", "w") as fh:
+    pointer_tmp = f"{pointer}.{os.getpid()}.tmp"
+    with open(pointer_tmp, "w") as fh:
         fh.write(gen_name + "\n")
-    os.replace(pointer + ".tmp", pointer)
+    os.replace(pointer_tmp, pointer)
     gens = sorted(d for d in os.listdir(out_dir)
                   if d.startswith("gen-") and os.path.isdir(os.path.join(out_dir, d)))
     for old in gens[:-keep] if keep and len(gens) > keep else []:
@@ -820,20 +825,37 @@ def write_generation(out_dir, tables, carry=(), keep=KEEP_GENERATIONS, now=None)
     return gen
 
 
-def keep_stronger_previous(attribution, previous, reason):
-    """When the network step failed, an IP whose NEW row is weaker than its row
-    in the previous generation keeps the previous row (evidence annotated), so
-    an outage never silently downgrades attribution. Returns the count kept."""
+# Methods whose evidence comes from Cymru / RDAP (lost when those are down) and
+# the methods a row falls back to when that evidence is missing.
+NETWORK_METHODS = {"registry_asn", "arin_rdap", "cymru_asn"}
+NETWORK_FALLBACK_METHODS = {"cymru_asn", "shodan_asn", "none"}
+
+
+def keep_stronger_previous(attribution, previous, reason, org_ids):
+    """When the network step failed, restore the previous generation's row for
+    an IP ONLY when its new row is weaker purely for lack of that network
+    evidence: the new row has NO conflict, names the same org (or none), its
+    method is a network fallback (cymru_asn / shodan_asn / none) while the
+    previous row's method depended on Cymru / RDAP, the previous row is
+    stronger, and the previous org still exists in the registry (a revoked
+    org is never resurrected). A new conflict, an ownership change or a
+    name/prefix-based new row is always kept as built. Returns the count kept."""
     kept = 0
     for i, row in enumerate(attribution):
         prev = previous.get(row["ip"])
         if not prev:
             continue
-        if rg.CONF_RANK.get(str(prev.get("confidence")), 0) > rg.CONF_RANK.get(row["confidence"], 0):
-            old = {c: ("" if prev.get(c) is None else str(prev.get(c))) for c in rg.ATTR_COLS}
-            old["evidence"] += f" (kept from previous build as_of {old['as_of']}: {reason})"
-            attribution[i] = old
-            kept += 1
+        prev_org = str(prev.get("org_id") or "")
+        if (row.get("conflict") or row["method"] not in NETWORK_FALLBACK_METHODS
+                or str(prev.get("method") or "") not in NETWORK_METHODS
+                or (row["org_id"] and row["org_id"] != prev_org)
+                or (prev_org and prev_org not in org_ids)
+                or rg.CONF_RANK.get(str(prev.get("confidence")), 0) <= rg.CONF_RANK.get(row["confidence"], 0)):
+            continue
+        old = {c: ("" if prev.get(c) is None else str(prev.get(c))) for c in rg.ATTR_COLS}
+        old["evidence"] += f" (kept from previous build as_of {old['as_of']}: {reason})"
+        attribution[i] = old
+        kept += 1
     return kept
 
 
@@ -865,6 +887,9 @@ def summarize(attribution, orgs_by_id, n_orgs, n_nets, n_doms, unreached):
     return "\n".join(lines)
 
 
+BUILD_LOCK = ".build.lock"          # under --out; one build_registry at a time
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true", help="build everything, write nothing to store/")
@@ -873,6 +898,24 @@ def main():
     ap.add_argument("--db", default=DB_PATH, help="path to exposure.duckdb")
     ap.add_argument("--out", default=rg.REGISTRY_STORE, help="output dir for the parquet files")
     args = ap.parse_args()
+    # Writer serialisation: an exclusive flock on <out>/.build.lock for the
+    # whole build (caches, generation, pointer). A second build exits cleanly.
+    os.makedirs(args.out, exist_ok=True)
+    lock_path = os.path.join(args.out, BUILD_LOCK)
+    with open(lock_path, "w") as lock_fh:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log(f"another build_registry run holds {lock_path}; exiting without changes")
+            return 0
+        try:
+            return build(args)
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+
+
+def build(args):
+    """The build proper (see module docstring); called by main() under the lock."""
     today = date.today()
     as_of = today.isoformat()
     network = not args.skip_network
@@ -923,7 +966,7 @@ def main():
     # A network outage must not downgrade what the last build already knew.
     if unreached and store_ok:
         previous = rg.Attributor().load(args.out).attribution
-        kept = keep_stronger_previous(attribution, previous, "; ".join(unreached))
+        kept = keep_stronger_previous(attribution, previous, "; ".join(unreached), set(ctx["orgs"]))
         log(f"network sources failed: {kept:,} IP(s) keep their stronger previous attribution")
 
     if args.dry_run:

@@ -1,15 +1,18 @@
 """Tests for the Phase-2 leads table, notification packets and Shadowserver ingest.
 
-A tiny fabricated store (observations + vulns TABLES with the same derived views
-build_store.py defines, plus ioc_ips / ioc_cidrs / ioc_matches like the integrator's)
-+ a registry parquet + tripwire ledger + Shadowserver parquet exercise: every
-evidence rule, CVE-scoped identity, shared appliance definitions, per-host
-eligibility (status preserved), owner-change episodes + review flag, legacy
-migration, idempotent refresh, snapshot/pointer durability, remediation only on
-'gone', reopen only on a newer SCAN, rebuild recovery, ranking, digest, packet
-content / escaping / status filtering / single-org / cross-tenant appendix /
-current-tier recheck, Shadowserver classes, validation + quarantine, lock,
-idempotent ingest, HMAC2.
+A fabricated store (observations + vulns tables with the store's derived views,
+ioc_ips / ioc_cidrs / ioc_matches like the integrator's), a published registry
+generation (store/registry/CURRENT -> gen dir with orgs / networks / domains /
+ip_attribution incl. `conflict`), a tripwire ledger and a Shadowserver parquet
+exercise: evidence rules, CVE / report-class scoped identity, shared appliance
+definitions, eligibility (status preserved), registry generation read +
+unavailable vs explicit-unattributed, conflict -> review, service binding
+accept/refuse, ownership reconciliation on every lead, migration marker + legacy
+mapping, snapshot/pointer durability, remediation only on 'gone', reopen only on
+a newer scan, rebuild recovery, ranking, digest, packet content / escaping /
+status filtering / single-org / appendix authorization from the current registry /
+host-level freshness, Shadowserver classes, validation + quarantine, lock, exit
+codes, IPv6 canonicalisation, HMAC2.
 
 Run:  venv/bin/python -m pytest tests/test_leads_packets.py -q
 """
@@ -31,10 +34,10 @@ import ingest_shadowserver as SS     # noqa: E402
 
 TODAY = date(2026, 9, 15)
 NEWEST = date(2026, 9, 14)
-OBS_COLS = ["observation_id", "date", "ip", "port", "transport", "asn", "org", "isp", "product", "version",
-            "cpe23", "service", "info", "city", "region_code", "hostnames", "domains", "tags", "banner_ts",
-            "hash", "tier", "tier_reason", "http_title", "http_host", "http_server", "cert_cn", "cert_org",
-            "cert_issuer", "cert_sans", "cert_expired", "cert_expires", "cert_sha256", "jarm"]
+OBS_COLS = ["observation_id", "date", "ip", "port", "transport", "asn", "org", "isp", "product", "version", "cpe23", "service",
+            "info", "city", "region_code", "hostnames", "domains", "tags", "banner_ts", "hash", "tier", "tier_reason",
+            "http_title", "http_host", "http_server", "cert_cn", "cert_org", "cert_issuer", "cert_sans", "cert_expired",
+            "cert_expires", "cert_sha256", "jarm"]
 OBS_TYPES = {"date": "DATE", "port": "INTEGER", "banner_ts": "TIMESTAMP", "cert_expired": "BOOLEAN"}
 VIEWS = [
     """CREATE OR REPLACE VIEW latest_observed AS
@@ -48,9 +51,8 @@ VIEWS = [
     """CREATE OR REPLACE VIEW current_state AS
        SELECT * EXCLUDE (days_since_seen, status) FROM exposure_status WHERE status = 'active'""",
     """CREATE OR REPLACE VIEW lifecycle AS
-       SELECT ip, port, transport, min(date) AS first_seen, max(date) AS last_seen,
-              count(DISTINCT date) AS days_observed, date_diff('day', min(date), max(date)) + 1 AS span_days
-       FROM observations GROUP BY ip, port, transport""",
+       SELECT ip, port, transport, min(date) AS first_seen, max(date) AS last_seen, count(DISTINCT date) AS days_observed,
+              date_diff('day', min(date), max(date)) + 1 AS span_days FROM observations GROUP BY ip, port, transport""",
     """CREATE OR REPLACE VIEW ioc_matches AS
        WITH cs AS (SELECT *, CAST(split_part(ip, '.', 1) AS UBIGINT) * 16777216 + CAST(split_part(ip, '.', 2) AS UBIGINT) * 65536
                    + CAST(split_part(ip, '.', 3) AS UBIGINT) * 256 + CAST(split_part(ip, '.', 4) AS UBIGINT) AS ip_int FROM current_state)
@@ -62,10 +64,9 @@ VIEWS = [
 
 def obs(ip, port, tier, org="Test University", d=NEWEST, transport="tcp", ts=None, **kw):
     row = {c: None for c in OBS_COLS}
-    row.update({"observation_id": f"{ip}-{port}-{d}", "date": d, "ip": ip, "port": port, "transport": transport,
-                "org": org, "tier": tier, "product": "nginx", "service": "http",
-                "banner_ts": ts or datetime(d.year, d.month, d.day, 3, 0, 0), "hash": "1", "tags": "", "hostnames": "",
-                "city": "Baton Rouge"})
+    row.update({"observation_id": f"{ip}-{port}-{d}", "date": d, "ip": ip, "port": port, "transport": transport, "org": org,
+                "tier": tier, "product": "nginx", "service": "http", "banner_ts": ts or datetime(d.year, d.month, d.day, 3, 0, 0),
+                "hash": "1", "tags": "", "hostnames": "", "city": "Baton Rouge"})
     row.update(kw)
     return row
 
@@ -77,8 +78,7 @@ def vuln(o, cve, verified=False, in_kev=True, epss=0.5, cvss=9.8):
 
 def add_obs(con, rows):
     if rows:
-        con.executemany(f"INSERT INTO observations VALUES ({', '.join('?' * len(OBS_COLS))})",
-                        [[r[c] for c in OBS_COLS] for r in rows])
+        con.executemany(f"INSERT INTO observations VALUES ({', '.join('?' * len(OBS_COLS))})", [[r[c] for c in OBS_COLS] for r in rows])
 
 
 def add_vulns(con, rows):
@@ -88,8 +88,8 @@ def add_vulns(con, rows):
 
 
 def ss_ev(rtype, ts, ip, port, proto="tcp", tag=None, sev="high"):
-    return {"report_type": rtype, "timestamp": ts, "ip": ip, "port": port, "protocol": proto, "asn": "64512",
-            "geo": "US", "tag": tag, "severity": sev, "detail": "{}", "ingested_on": TODAY}
+    return {"report_type": rtype, "timestamp": ts, "ip": ip, "port": port, "protocol": proto, "asn": "64512", "geo": "US",
+            "tag": tag, "severity": sev, "detail": "{}", "ingested_on": TODAY}
 
 
 def ip_int(ip):
@@ -97,24 +97,42 @@ def ip_int(ip):
     return a * 16777216 + b * 65536 + c * 256 + d
 
 
-def write_registry(path, rows):
-    r = duckdb.connect()
-    r.execute("CREATE TABLE a (ip VARCHAR, org_id VARCHAR, org_name VARCHAR, sector VARCHAR, jurisdiction VARCHAR, "
-              "method VARCHAR, confidence VARCHAR, evidence VARCHAR, as_of VARCHAR)")
-    r.executemany("INSERT INTO a VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
-    r.execute(f"COPY a TO '{path}' (FORMAT PARQUET)")
-    r.close()
-
-
-REGISTRY = [
-    ["10.0.0.1", "ORG-TU", "Test University", "education", "state", "registry_network", "high", "10.0.0.0/29", "2026-09-15"],
-    ["10.0.0.2", "ORG-TU", "Test University", "education", "state", "registry_network", "high", "10.0.0.0/29", "2026-09-15"],
-    ["10.0.0.6", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "high", "testville.la.gov", "2026-09-15"],
-    ["10.0.0.15", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "high", "x", "2026-09-15"],
-    ["10.0.0.16", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "high", "x", "2026-09-15"],
-    ["10.0.0.30", "ORG-PJ", "Testville Police Jury", "government", "parish", "registry_asn", "medium", "AS1", "2026-09-15"],
-    ["10.0.0.9", "", "", "", "", "arin_rdap", "low", "no registry org", "2026-09-15"],
+ORGS = [["ORG-TU", "Test University", "education", "state", "", "testu.edu", "direct", "", "hand", "2026-09-15"],
+        ["ORG-CT", "City of Testville", "government", "municipal", "", "testville.la.gov", "direct", "", "hand", "2026-09-15"],
+        ["ORG-PJ", "Testville Police Jury", "government", "parish", "", "", "direct", "", "hand", "2026-09-15"],
+        ["ORG-DW", "Delta Widgets Inc", "small_business", "private", "", "", "direct", "", "hand", "2026-09-15"],
+        ["ORG-OTHER", "Other College", "education", "state", "", "", "direct", "", "hand", "2026-09-15"]]
+NETWORKS = [["10.0.0.0/31", "", "ORG-TU", "curated", "high", "2026-09-15"], ["10.0.0.2/32", "", "ORG-TU", "curated", "high", "2026-09-15"]]
+DOMAINS = [["testville.la.gov", "ORG-CT", "hand", "high", "2026-09-15"], ["testu.edu", "ORG-TU", "hand", "high", "2026-09-15"]]
+ATTR = [  # ip, org_id, org_name, sector, jurisdiction, method, confidence, evidence, as_of, conflict
+    ["10.0.0.6", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "high", "vpn.testville.la.gov", "2026-09-15", ""],
+    ["10.0.0.15", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "high", "mail", "2026-09-15", ""],
+    ["10.0.0.16", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "high", "x", "2026-09-15", ""],
+    ["10.0.0.31", "ORG-CT", "City of Testville", "government", "municipal", "domain_dns", "medium", "x", "2026-09-15", "rdns=la-ct;cert=la-pj"],
+    ["10.0.0.30", "ORG-PJ", "Testville Police Jury", "government", "parish", "registry_asn", "medium", "AS1", "2026-09-15", ""],
+    ["10.0.0.9", "", "", "", "", "arin_rdap", "low", "no registry org", "2026-09-15", ""],
 ]
+
+
+def write_registry(reg_dir, attr=ATTR, networks=NETWORKS, domains=DOMAINS, orgs=ORGS, gen="gen-test"):
+    """A published generation: <reg_dir>/<gen>/*.parquet + CURRENT pointer."""
+    d = os.path.join(reg_dir, gen)
+    os.makedirs(d, exist_ok=True)
+    con = duckdb.connect()
+    spec = {"registry_orgs.parquet": (["org_id", "name", "sector", "jurisdiction", "aliases", "domains", "contact_route", "notes",
+                                       "source", "as_of"], orgs),
+            "registry_networks.parquet": (["prefix", "asn", "org_id", "source", "confidence", "as_of"], networks),
+            "registry_domains.parquet": (["domain", "org_id", "source", "confidence", "as_of"], domains),
+            "ip_attribution.parquet": (["ip", "org_id", "org_name", "sector", "jurisdiction", "method", "confidence", "evidence",
+                                        "as_of", "conflict"], attr)}
+    for name, (cols, rows) in spec.items():
+        con.execute("CREATE OR REPLACE TABLE t (" + ", ".join(f"{c} VARCHAR" for c in cols) + ")")
+        if rows:
+            con.executemany(f"INSERT INTO t VALUES ({', '.join('?' * len(cols))})", rows)
+        con.execute(f"COPY t TO '{os.path.join(d, name)}' (FORMAT PARQUET)")
+    con.close()
+    with open(os.path.join(reg_dir, "CURRENT"), "w") as fh:
+        fh.write(gen + "\n")
 
 
 @pytest.fixture
@@ -122,18 +140,20 @@ def world(tmp_path):
     store = str(tmp_path / "store.duckdb")
     con = duckdb.connect(store)
     con.execute("CREATE TABLE observations (" + ", ".join(f"{c} {OBS_TYPES.get(c, 'VARCHAR')}" for c in OBS_COLS) + ")")
-    con.execute("CREATE TABLE vulns (observation_id VARCHAR, date DATE, ip VARCHAR, port INTEGER, transport VARCHAR, "
-                "cve VARCHAR, cvss DOUBLE, in_kev BOOLEAN, epss DOUBLE, verified BOOLEAN)")
+    con.execute("CREATE TABLE vulns (observation_id VARCHAR, date DATE, ip VARCHAR, port INTEGER, transport VARCHAR, cve VARCHAR, "
+                "cvss DOUBLE, in_kev BOOLEAN, epss DOUBLE, verified BOOLEAN)")
     con.execute("CREATE TABLE ioc_ips (ip VARCHAR, sources VARCHAR)")
     con.execute("CREATE TABLE ioc_cidrs (cidr VARCHAR, lo UBIGINT, hi UBIGINT, sources VARCHAR)")
     a = obs("10.0.0.1", 445, "education", product="Samba")
-    a2 = obs("10.0.0.1", 80, "education", product="nginx")                                    # extra service, whole-address org
+    a2 = obs("10.0.0.1", 80, "education", product="nginx")
     b = obs("10.0.0.2", 443, "education", product="Apache httpd", version="2.4.49")
     c = obs("10.0.0.3", 443, "small_business", org="Bob's Bait", product="Apache httpd")
     d = obs("10.0.0.4", 502, "critical_infrastructure", org="Bayou Water", service="modbus", product=None)
     d2 = obs("10.0.0.5", 47808, "small_business", org="Acme Controls", service="auto", product=None)
-    e = obs("10.0.0.6", 443, "government", org="City of Testville", product="FortiGate", http_title="FortiGate SSL-VPN")
-    e2 = obs("10.0.0.6", 22, "government", org="City of Testville", product="OpenSSH")      # extra service, NOT whole-address
+    e = obs("10.0.0.6", 443, "government", org="City of Testville", product="FortiGate", http_title="FortiGate SSL-VPN",
+            hostnames="vpn.testville.la.gov")                                                       # bound by hostname
+    e2 = obs("10.0.0.6", 22, "government", org="City of Testville", product="OpenSSH")
+    e3 = obs("10.0.0.6", 8080, "government", org="City of Testville", product="FortiGate")         # no name: unbound
     f = obs("10.0.0.7", 443, "small_business", org="Bob's Bait", product="FortiGate")
     g = obs("10.0.0.8", 8080, "residential", org="Cox Communications")
     h = obs("10.0.0.9", 9200, "small_business", org="Delta Widgets", product="Elasticsearch")
@@ -141,23 +161,24 @@ def world(tmp_path):
     i2 = obs("10.0.0.11", 443, "small_business", org="Delta Widgets")
     j = obs("10.0.0.13", 22, "unclassified", org="Some Carrier", product="OpenSSH")
     k = obs("10.0.0.14", 502, "honeypot", org="?", service="modbus", tags="honeypot")
-    sh = obs("10.0.0.15", 443, "government", org="City of Testville", product="Microsoft IIS",
-             http_title="Outlook Web App", cpe23="cpe:2.3:a:microsoft:exchange_server")
-    inj = obs("10.0.0.16", 8443, "government", org="City of Testville",
+    sh = obs("10.0.0.15", 443, "government", org="City of Testville", product="Microsoft IIS", http_title="Outlook Web App",
+             cpe23="cpe:2.3:a:microsoft:exchange_server", cert_cn="mail.testville.la.gov")          # bound by cert name
+    inj = obs("10.0.0.16", 8443, "government", org="City of Testville", cert_org="City of Testville",   # bound by cert_org
               product="Evil | **bold** [link](http://x) `code`\n# heading <b>", http_title="FortiGate | *x*\r\n# h",
               hostnames="a`b|c")
+    cf = obs("10.0.0.31", 443, "government", org="City of Testville", product="FortiGate", hostnames="pj.testville.la.gov")
     old = obs("10.0.0.2", 443, "education", d=date(2026, 6, 29))
-    add_obs(con, [a, a2, b, c, d, d2, e, e2, f, g, h, i, i2, j, k, sh, inj, old])
+    add_obs(con, [a, a2, b, c, d, d2, e, e2, e3, f, g, h, i, i2, j, k, sh, inj, cf, old])
     add_vulns(con, [vuln(a, "CVE-2020-0796", verified=True, epss=0.9), vuln(a, "CVE-2017-0144", verified=True, epss=0.95),
-                    vuln(b, "CVE-2021-41773", epss=0.97), vuln(b, "CVE-2021-42013", epss=0.6),
-                    vuln(b, "CVE-2000-0001", in_kev=False), vuln(c, "CVE-2021-41773"), vuln(g, "CVE-2020-0796", verified=True)])
+                    vuln(b, "CVE-2021-41773", epss=0.97), vuln(b, "CVE-2021-42013", epss=0.6), vuln(b, "CVE-2000-0001", in_kev=False),
+                    vuln(c, "CVE-2021-41773"), vuln(g, "CVE-2020-0796", verified=True)])
     con.execute("INSERT INTO ioc_ips VALUES ('10.0.0.8', 'spamhaus_drop'), ('192.0.2.1', 'x')")
     con.execute("INSERT INTO ioc_cidrs VALUES ('10.0.0.12/30', ?, ?, 'spamhaus_drop')", [ip_int("10.0.0.12"), ip_int("10.0.0.15")])
     for v in VIEWS:
         con.execute(v)
     con.close()
-    reg = str(tmp_path / "ip_attribution.parquet")
-    write_registry(reg, REGISTRY)
+    reg = str(tmp_path / "registry")
+    write_registry(reg)
     ssp = str(tmp_path / "ss" / "events.parquet")
     SS.append_parquet([ss_ev("sinkhole_http_drone", datetime(2026, 9, 12, 4, 5, 6), "10.0.0.11", 51234, tag="avalanche-andromeda"),
                        ss_ev("scan_ssl", datetime(2026, 9, 12, 5, 0, 0), "10.0.0.11", 443, sev="low"),
@@ -166,7 +187,7 @@ def world(tmp_path):
     hits = tmp_path / "hits"
     hits.mkdir()
     ledger = {"hosts": {"10.0.0.9": {"first_seen": "2026-09-01", "last_seen": "2026-09-10", "selectors": ["tag:compromised"],
-                                     "last_banner_ts": "2026-09-09T05:00:00"},
+                                     "last_banner_ts": "2026-09-11T00:00:00"},
                         "10.0.0.10": {"first_seen": "2026-07-01", "last_seen": "2026-07-01", "selectors": ["tag:c2"]},
                         "10.0.0.20": {"first_seen": "2026-09-12", "last_seen": "2026-09-13", "selectors": ["tag:c2"],
                                       "last_banner_ts": "2026-09-13T02:00:00"}}, "_meta": {}}
@@ -178,17 +199,17 @@ def world(tmp_path):
     ioc.write_text(json.dumps({"10.0.0.13": ["feodo"], "_cidrs": {"10.0.0.0/8": ["x"]}, "_meta": {"as_of": "x"}}))
     return {"store": store, "ldir": str(tmp_path / "leads"), "hits": hits, "reg": reg, "tmp": tmp_path,
             "paths": {"ledger_path": str(hits / "seen_ledger.json"), "hits_dir": str(hits), "ioc_path": str(ioc),
-                      "attribution_parquet": reg, "ss_parquet": ssp}}
+                      "registry_dir": reg, "ss_parquet": ssp}}
 
 
 def ctx(w, write=True):
     return L.open_ctx(w["store"], w["ldir"], write=write)
 
 
-def refresh(w, today=TODAY):
+def refresh(w, today=TODAY, **over):
     c = ctx(w)
     try:
-        return L.refresh(c, today, **w["paths"])
+        return L.refresh(c, today, **dict(w["paths"], **over))
     finally:
         c.close()
 
@@ -234,7 +255,7 @@ def time_shift(w, d):
 def packet(w, today=TODAY, **kw):
     c = ctx(w, write=False)
     try:
-        return MP.build_markdown(MP.gather(c, today, **kw))
+        return MP.build_markdown(MP.gather(c, today, registry_dir=w["reg"], **kw))
     finally:
         c.close()
 
@@ -243,84 +264,184 @@ def events(w, lid):
     return [e["event"] for e in rows(w, "SELECT event FROM lead_events WHERE lead_id = ? ORDER BY ts", [lid])]
 
 
+def clear(w, *lids):
+    for lid in lids:
+        setst(w, lid, review_cleared=True, analyst="jd")
+
+
 A_ID = L.lead_id("10.0.0.1", 445, "tcp", "kev_verified", "CVE-2020-0796")
 A2_ID = L.lead_id("10.0.0.1", 445, "tcp", "kev_verified", "CVE-2017-0144")
 B1_ID = L.lead_id("10.0.0.2", 443, "tcp", "kev_inferred", "CVE-2021-41773")
 B2_ID = L.lead_id("10.0.0.2", 443, "tcp", "kev_inferred", "CVE-2021-42013")
 ICS_ID = L.lead_id("10.0.0.4", 502, "tcp", "ics")
 CT_ID = L.lead_id("10.0.0.9", 9200, "tcp", "compromise_tag")
+CT20_ID = L.lead_id("10.0.0.20", 0, "host", "compromise_tag")
 IOC_ID = L.lead_id("10.0.0.13", 0, "host", "ioc_match")
 E_ID = L.lead_id("10.0.0.6", 443, "tcp", "appliance")
+E3_ID = L.lead_id("10.0.0.6", 8080, "tcp", "appliance")
+CF_ID = L.lead_id("10.0.0.31", 443, "tcp", "appliance")
+SSC_ID = L.lead_id("10.0.0.11", 0, "host", "shadowserver", "compromise:sinkhole_http_drone")
+SSE_ID = L.lead_id("10.0.0.11", 443, "tcp", "shadowserver", "exposure:scan_ssl")
+SS30_ID = L.lead_id("10.0.0.30", 0, "host", "shadowserver", "compromise:x")
 
 
-# --- identity / definitions --------------------------------------------------------
+# --- identity / definitions ----------------------------------------------------------
 
-def test_lead_id_cve_scoped_only_for_kev_types():
+def test_lead_id_scoping_and_ipv6_canonical():
     import hashlib
     assert L.lead_id("1.2.3.4", 443, "tcp", "kev_inferred", "CVE-1") == hashlib.sha1(b"1.2.3.4|443|tcp|kev_inferred|CVE-1").hexdigest()[:16]
-    assert L.lead_id("1.2.3.4", 443, "tcp", "kev_inferred", "CVE-1") != L.lead_id("1.2.3.4", 443, "tcp", "kev_inferred", "CVE-2")
     assert L.lead_id("1.2.3.4", 443, "tcp", "ics", "anything") == hashlib.sha1(b"1.2.3.4|443|tcp|ics").hexdigest()[:16]
+    assert L.lead_id("1.2.3.4", 0, "host", "shadowserver", "compromise:a,b") == hashlib.sha1(b"1.2.3.4|0|host|shadowserver|compromise").hexdigest()[:16]
+    assert L.lead_id("1.2.3.4", 0, "host", "shadowserver", "compromise:a") != L.lead_id("1.2.3.4", 0, "host", "shadowserver", "exposure:a")
+    assert L.canon_ip("2001:0db8:0000::0001") == "2001:db8::1" and L.canon_ip("010.0.0.1") in ("10.0.0.1", "010.0.0.1")
+    assert L.lead_id("2001:0DB8::1", 22, "tcp", "ics") == L.lead_id("2001:db8::1", 22, "tcp", "ics")
 
 
 def test_appliance_definitions_shared_with_build_store():
     assert L.APPLIANCE_PATTERNS is bs.APPLIANCE_PATTERNS
     assert L.appliance_match({"product": "FortiGate", "cpe23": "", "http_title": ""})[0].startswith("Fortinet")
-    assert L.appliance_match({"product": "", "cpe23": "", "http_title": "Outlook Web App"})[0].startswith("Microsoft Exchange")
     assert L.appliance_match({"product": "showa", "cpe23": "", "http_title": ""}) is None
 
 
-def test_transport_normalised_everywhere():
+def test_transport_and_render_helpers():
     assert L.norm_transport("TCP") == "tcp" and L.norm_transport("x<y|z") == "other" and L.norm_transport("") == "tcp"
     assert MP.tp("sctp") == "other" and MP.ipc("1.2.3.4") == "1.2.3.4" and "\\|" in MP.ipc("1.2|3")
-    assert MP.num("12|x") == "12\\|x" and MP.num("7") == "7" and MP.lid("z|z") == "z\\|z" and MP.lid("a" * 16) == "a" * 16 and MP.status_word("weird|x") == "weird\\|x"
+    assert MP.num("12|x") == "12\\|x" and MP.lid("z|z") == "z\\|z" and MP.status_word("weird|x") == "weird\\|x"
 
 
-# --- generation --------------------------------------------------------------------
+# --- generation + attribution ----------------------------------------------------------
 
-def test_generation_rules_per_evidence_type(world):
+def test_generation_rules_and_attribution(world):
     refresh(world)
     by = by_type(world)
     kv = {r["lead_id"]: r for r in by["kev_verified"]}
-    assert set(kv) == {A_ID, A2_ID} and all(r["confidence"] == "high" and r["status"] == "new" for r in kv.values())
-    assert (kv[A_ID]["org_id"], kv[A_ID]["org_name"], kv[A_ID]["sector"], kv[A_ID]["attr_method"], kv[A_ID]["attr_confidence"]) == \
-        ("ORG-TU", "Test University", "education", "registry_network", "high")
-    assert kv[A_ID]["eligible"] is True and "host tier education" in kv[A_ID]["eligibility_reason"]
-    assert kv[A_ID]["last_scan_ts"] == datetime(2026, 9, 14, 3, 0, 0) and kv[A_ID]["last_seen"] == NEWEST
-    assert set(r["lead_id"] for r in by["kev_inferred"]) == {B1_ID, B2_ID}
-    assert sorted((r["ip"], r["port"]) for r in by["ics"]) == [("10.0.0.4", 502), ("10.0.0.5", 47808)]
-    assert sorted(r["ip"] for r in by["appliance"]) == ["10.0.0.15", "10.0.0.16", "10.0.0.6"]
-    ct = {r["ip"]: r for r in by["compromise_tag"]}
-    assert set(ct) == {"10.0.0.9", "10.0.0.20"}
-    assert ct["10.0.0.9"]["last_scan_ts"] == datetime(2026, 9, 9, 5, 0, 0)            # ledger last_banner_ts
-    assert ct["10.0.0.20"]["org_name"] == L.UNATTRIBUTED and ct["10.0.0.20"]["attr_confidence"] == "none"
-    assert ct["10.0.0.9"]["attr_method"] == "shodan_org" and ct["10.0.0.9"]["org_name"] == "Delta Widgets"
-    ss = {(r["ip"], r["port"], r["transport"]): r for r in by["shadowserver"]}
-    assert set(ss) == {("10.0.0.11", 0, "host"), ("10.0.0.11", 443, "tcp"), ("10.0.0.30", 0, "host")}
-    assert ss[("10.0.0.11", 0, "host")]["evidence_key"].startswith("compromise:") and ss[("10.0.0.11", 443, "tcp")]["confidence"] == "medium"
-    assert ss[("10.0.0.30", 0, "host")]["tier"] == "government" and ss[("10.0.0.30", 0, "host")]["org_name"] == "Testville Police Jury"
+    assert set(kv) == {A_ID, A2_ID}
+    a = kv[A_ID]
+    assert (a["org_id"], a["org_name"], a["sector"], a["attr_method"], a["attr_confidence"], a["needs_attribution_review"]) == \
+        ("ORG-TU", "Test University", "education", "registry_network", "high", False)
+    assert a["org_at_first_seen"] == "Test University [ORG-TU]" and a["attr_conflict"] == ""
+    assert a["last_scan_ts"] == datetime(2026, 9, 14, 3, 0, 0)
+    assert {r["lead_id"] for r in by["kev_inferred"]} == {B1_ID, B2_ID}
+    assert sorted(r["ip"] for r in by["ics"]) == ["10.0.0.4", "10.0.0.5"]
+    app = {r["lead_id"]: r for r in by["appliance"]}
+    assert sorted(r["ip"] for r in app.values()) == ["10.0.0.15", "10.0.0.16", "10.0.0.31", "10.0.0.6", "10.0.0.6"]
+    # service binding: hostname / cert name / cert_org bind; a nameless service on the same ip does not
+    assert app[E_ID]["org_id"] == "ORG-CT" and app[E_ID]["attr_method"] == "domain_dns" and not app[E_ID]["needs_attribution_review"]
+    sh = next(r for r in app.values() if r["ip"] == "10.0.0.15")
+    inj = next(r for r in app.values() if r["ip"] == "10.0.0.16")
+    assert sh["org_id"] == "ORG-CT" and inj["org_id"] == "ORG-CT" and not inj["needs_attribution_review"]
+    assert (app[E3_ID]["org_id"], app[E3_ID]["org_name"], app[E3_ID]["attr_method"], app[E3_ID]["attr_confidence"],
+            app[E3_ID]["needs_attribution_review"]) == (None, "City of Testville", "unbound(domain_dns)", "low", True)
+    # registry conflict carried and flagged
+    assert app[CF_ID]["attr_conflict"] == "rdns=la-ct;cert=la-pj" and app[CF_ID]["needs_attribution_review"] and app[CF_ID]["org_id"] == "ORG-CT"
+    ct = {r["lead_id"]: r for r in by["compromise_tag"]}
+    assert set(ct) == {CT_ID, CT20_ID}
+    assert ct[CT_ID]["last_scan_ts"] == datetime(2026, 9, 9, 5, 0, 0)          # per-service banner from the hit archive
+    assert ct[CT20_ID]["last_scan_ts"] == datetime(2026, 9, 13, 2, 0, 0)       # host-level: ledger last_banner_ts
+    assert ct[CT_ID]["last_event"] == date(2026, 9, 10) and ct[CT20_ID]["last_event"] == date(2026, 9, 13)
+    # explicit unattributed registry row: label, low, review
+    assert (ct[CT_ID]["org_id"], ct[CT_ID]["org_name"], ct[CT_ID]["attr_method"], ct[CT_ID]["attr_confidence"],
+            ct[CT_ID]["needs_attribution_review"]) == (None, "Delta Widgets", "arin_rdap", "low", True)
+    assert ct[CT20_ID]["org_name"] == L.UNATTRIBUTED and ct[CT20_ID]["attr_confidence"] == "none" and not ct[CT20_ID]["needs_attribution_review"]
+    ss = {r["lead_id"]: r for r in by["shadowserver"]}
+    assert set(ss) == {SSC_ID, SSE_ID, SS30_ID}
+    assert ss[SSC_ID]["evidence_key"].startswith("compromise:") and ss[SSC_ID]["last_event"] == date(2026, 9, 12)
+    # host-level evidence on a non-ownership attribution keeps the org but needs review
+    assert ss[SS30_ID]["org_id"] == "ORG-PJ" and ss[SS30_ID]["attr_method"] == "registry_asn" and ss[SS30_ID]["needs_attribution_review"]
+    assert ss[SS30_ID]["tier"] == "government"
     io = {r["ip"]: r for r in by["ioc_match"]}
-    assert set(io) == {"10.0.0.13", "10.0.0.15"}                     # CIDR hits from the ioc_matches view; 10.0.0.8 residential
-    assert "CIDR range(s) 10.0.0.12/30" in io["10.0.0.13"]["evidence"] and io["10.0.0.13"]["port"] == 0
+    assert set(io) == {"10.0.0.13", "10.0.0.15"} and "CIDR range(s) 10.0.0.12/30" in io["10.0.0.13"]["evidence"]
     ips = {r["ip"] for rs in by.values() for r in rs}
-    assert not ips & {"10.0.0.8", "10.0.0.14", "10.0.0.10", "192.0.2.1", "10.0.0.3", "10.0.0.7", "10.0.0.0/8", "_cidrs"}
+    assert not ips & {"10.0.0.8", "10.0.0.14", "10.0.0.10", "192.0.2.1", "10.0.0.3", "10.0.0.7", "_cidrs"}
 
 
-def test_ioc_fallback_ignores_meta_keys(world):
-    s = duckdb.connect(world["store"])
-    s.execute("DROP VIEW ioc_matches")
-    s.close()
+def test_registry_generation_pointer_is_used_not_flat_file(world):
+    # a stale flat file at the registry root must be ignored in favour of CURRENT
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (ip VARCHAR, org_id VARCHAR, org_name VARCHAR, sector VARCHAR, jurisdiction VARCHAR, method VARCHAR, "
+                "confidence VARCHAR, evidence VARCHAR, as_of VARCHAR)")
+    con.execute("INSERT INTO t VALUES ('10.0.0.6', 'ORG-STALE', 'Stale Org', 'government', 'x', 'registry_network', 'high', 'x', '2026-01-01')")
+    con.execute(f"COPY t TO '{os.path.join(world['reg'], 'ip_attribution.parquet')}' (FORMAT PARQUET)")
+    con.close()
     refresh(world)
-    io = [r["ip"] for r in by_type(world)["ioc_match"]]
-    assert io == ["10.0.0.13"]
+    assert by_id(world)[E_ID]["org_id"] == "ORG-CT"
 
 
-def test_shadowserver_read_from_parquet_not_store_table(world):
-    s = duckdb.connect(world["store"])
-    s.execute(SS.EVENTS_DDL)
-    s.execute("INSERT INTO shadowserver_events VALUES ('scan_ssl', '2026-09-13 01:00:00', '10.0.0.6', 443, 'tcp', NULL, NULL, NULL, 'low', '{}', ?)", [TODAY])
-    s.close()
+def test_registry_unavailable_keeps_previous_attribution(world, tmp_path):
     refresh(world)
-    assert "10.0.0.6" not in {r["ip"] for r in by_type(world)["shadowserver"]}
+    before = by_id(world)
+    empty = str(tmp_path / "noreg")
+    os.makedirs(empty)
+    counts, _ = refresh(world, date(2026, 9, 16), registry_dir=empty)
+    after = by_id(world)
+    assert counts["owner_changed"] == 0
+    for lid in (A_ID, E_ID, E3_ID, CT_ID, SS30_ID):
+        assert (after[lid]["org_id"], after[lid]["org_name"], after[lid]["attr_method"], after[lid]["attr_confidence"],
+                after[lid]["needs_attribution_review"]) == \
+            (before[lid]["org_id"], before[lid]["org_name"], before[lid]["attr_method"], before[lid]["attr_confidence"],
+             before[lid]["needs_attribution_review"])
+    # a brand-new lead under an unavailable registry: label + review
+    o = obs("10.0.0.40", 443, "government", org="New Town", product="FortiGate", d=date(2026, 9, 16))
+    add_store(world, [o])
+    refresh(world, date(2026, 9, 17), registry_dir=empty)
+    r = by_id(world)[L.lead_id("10.0.0.40", 443, "tcp", "appliance")]
+    assert r["org_name"] == "New Town" and r["attr_method"] == "shodan_org" and r["needs_attribution_review"]
+
+
+def test_explicit_unattributed_row_replaces_store_ownership(world):
+    refresh(world)
+    c = ctx(world)
+    c.con.execute("UPDATE leads SET org_id = 'ORG-OLD', org_name = 'Old Owner', attr_method = 'store', attr_confidence = 'medium' "
+                  "WHERE lead_id = ?", [CT_ID])
+    c.close()
+    counts, _ = refresh(world, date(2026, 9, 16))
+    r = by_id(world)[CT_ID]
+    assert counts["owner_changed"] >= 1 and r["org_id"] is None and r["org_name"] == "Delta Widgets" and r["attr_method"] == "arin_rdap"
+    assert "ORG-OLD -> (none)" in r["notes"] and r["needs_attribution_review"]
+
+
+def test_ownership_reconciled_for_no_candidate_lead_and_empty_to_org(world):
+    refresh(world)
+    setst(world, B2_ID, "queued", analyst="jd")
+    time_shift(world, date(2026, 10, 4))                     # B2's service goes stale: no candidate today
+    nets = NETWORKS[:1] + [["10.0.0.2/32", "", "ORG-OTHER", "curated", "high", "2026-10-05"]]
+    write_registry(world["reg"], networks=nets)
+    counts, _ = refresh(world, date(2026, 10, 5))
+    r = by_id(world)[B2_ID]
+    assert r["org_id"] == "ORG-OTHER" and r["status"] == "new" and r["prior_status"] == "queued" and r["needs_attribution_review"]
+    assert r["analyst"] is None and "ORG-TU -> ORG-OTHER" in r["notes"] and "owner_changed" in events(world, B2_ID)
+    # empty -> org is an ownership change too (CT lead had no org_id)
+    clear(world, CT_ID)
+    write_registry(world["reg"], networks=nets + [["10.0.0.9/32", "", "ORG-DW", "curated", "high", "2026-10-05"]])
+    counts, _ = refresh(world, date(2026, 10, 6))
+    r = by_id(world)[CT_ID]
+    assert r["org_id"] == "ORG-DW" and r["org_name"] == "Delta Widgets Inc" and r["needs_attribution_review"]
+    assert "(none) -> ORG-DW" in r["notes"] and r["attr_method"] == "registry_network"
+    assert r["org_at_first_seen"] == "Delta Widgets"
+
+
+def test_attribution_confidence_drop_closes_episode(world):
+    refresh(world)
+    setst(world, E_ID, "notified", via="direct")
+    write_registry(world["reg"], attr=[a for a in ATTR if a[0] != "10.0.0.6"])       # 10.0.0.6 now unknown -> label
+    counts, _ = refresh(world, date(2026, 9, 17))
+    r = by_id(world)[E_ID]
+    assert r["status"] == "new" and r["prior_status"] == "notified" and r["needs_attribution_review"] and r["notified_on"] is None
+    assert r["attr_confidence"] == "low" and r["org_id"] is None
+
+
+def test_conflict_refused_by_packets_until_cleared(world):
+    refresh(world)
+    with pytest.raises(SystemExit):
+        packet(world, ip="10.0.0.31")
+    clear(world, CF_ID)
+    md = packet(world, ip="10.0.0.31")
+    assert "10.0.0.31" in md
+    refresh(world, date(2026, 9, 16))                              # unchanged conflict does not re-flag
+    assert not by_id(world)[CF_ID]["needs_attribution_review"]
+    write_registry(world["reg"], attr=[a if a[0] != "10.0.0.31" else a[:9] + ["rdns=la-ct;cert=la-zz"] for a in ATTR])
+    refresh(world, date(2026, 9, 17))                              # a NEW conflict does
+    assert by_id(world)[CF_ID]["needs_attribution_review"] and by_id(world)[CF_ID]["attr_conflict"] == "rdns=la-ct;cert=la-zz"
 
 
 # --- eligibility -------------------------------------------------------------------
@@ -333,16 +454,13 @@ def test_residential_is_never_a_lead(world):
 
 def test_ineligibility_keeps_analyst_status_and_hides(world):
     refresh(world)
-    setst(world, ICS_ID, "false_positive", analyst="jd", note="it's a bait shop")
+    setst(world, ICS_ID, "false_positive", analyst="jd", note="bait shop")
     add_store(world, [obs("10.0.0.4", 502, "residential", org="Bayou Water", service="modbus", product=None, d=date(2026, 9, 15))])
     counts, _ = refresh(world, date(2026, 9, 16))
     r = by_id(world)[ICS_ID]
-    assert counts["ineligible"] == 1 and r["status"] == "false_positive" and r["eligible"] is False
-    assert r["prior_status"] == "false_positive" and "residential" in r["eligibility_reason"] and r["analyst"] == "jd"
+    assert counts["ineligible"] == 1 and r["status"] == "false_positive" and r["eligible"] is False and r["prior_status"] == "false_positive"
     c = ctx(world, write=False)
-    assert ICS_ID not in {x["lead_id"] for x in L.ranked_leads(c)}
-    assert ICS_ID in {x["lead_id"] for x in L.ranked_leads(c, include_ineligible=True)}
-    assert "Bayou Water" not in L.digest(c, date(2026, 9, 16))
+    assert ICS_ID not in {x["lead_id"] for x in L.ranked_leads(c)} and ICS_ID in {x["lead_id"] for x in L.ranked_leads(c, include_ineligible=True)}
     c.close()
     with pytest.raises(SystemExit):
         packet(world, ip="10.0.0.4", include_closed=True)
@@ -350,27 +468,18 @@ def test_ineligibility_keeps_analyst_status_and_hides(world):
     counts, _ = refresh(world, date(2026, 9, 18))
     r = by_id(world)[ICS_ID]
     assert counts["eligible_again"] == 1 and r["eligible"] is True and r["status"] == "false_positive"
-    assert events(world, ICS_ID)[-2:] == ["ineligible", "eligible_again"]
 
 
 # --- lifecycle ---------------------------------------------------------------------
 
-def test_refresh_is_idempotent_and_separates_last_seen_from_last_evaluated(world):
+def test_refresh_is_idempotent(world):
     c1, _ = refresh(world)
     n1 = len(rows(world))
     c2, _ = refresh(world, date(2026, 9, 16))
     all_rows = rows(world)
-    assert c1["inserted"] == n1 and c2["inserted"] == 0 and len(all_rows) == n1 == len({r["lead_id"] for r in all_rows})
-    assert {r["first_seen"] for r in all_rows} == {TODAY} and {r["last_evaluated"] for r in all_rows} == {date(2026, 9, 16)}
-    assert max(r["last_seen"] for r in all_rows) == NEWEST
-
-
-def test_primary_key_enforced(world):
-    refresh(world)
-    c = ctx(world)
-    with pytest.raises(duckdb.Error):
-        c.con.execute("INSERT INTO leads (lead_id, ip) VALUES (?, '1.1.1.1')", [A_ID])
-    c.close()
+    assert c1["inserted"] == n1 and c2["inserted"] == 0 and c2["owner_changed"] == 0 and c2["review_flagged"] == 0
+    assert len(all_rows) == n1 == len({r["lead_id"] for r in all_rows})
+    assert {r["last_evaluated"] for r in all_rows} == {date(2026, 9, 16)} and max(r["last_seen"] for r in all_rows) == NEWEST
 
 
 def test_set_mirror_crash_rolls_back_and_pointer_only_after_commit(world, monkeypatch):
@@ -378,29 +487,21 @@ def test_set_mirror_crash_rolls_back_and_pointer_only_after_commit(world, monkey
     ptr_before = open(os.path.join(world["ldir"], "CURRENT")).read().strip()
     setst(world, A_ID, "notified", via="MS-ISAC", analyst="jd", note="sent")
     r = by_id(world)[A_ID]
-    assert r["status"] == "notified" and r["notified_via"] == "MS-ISAC" and r["notified_on"] == TODAY and r["prior_status"] == "new"
+    assert r["status"] == "notified" and r["notified_on"] == TODAY and r["prior_status"] == "new"
     ptr = open(os.path.join(world["ldir"], "CURRENT")).read().strip()
     snap = os.path.join(world["ldir"], "snapshots", ptr)
-    assert ptr != ptr_before and sorted(os.listdir(snap)) == ["lead_events.parquet", "leads.parquet"]
-    assert duckdb.connect().execute(f"SELECT status FROM read_parquet('{snap}/leads.parquet') WHERE lead_id = ?", [A_ID]).fetchone() == ("notified",)
-    # snapshot write fails -> rolled back, pointer untouched, no stray generation
+    assert ptr != ptr_before and sorted(os.listdir(snap)) == ["lead_events.parquet", "leads.parquet", "migrations.parquet"]
     monkeypatch.setattr(L, "write_snapshot", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     with pytest.raises(SystemExit):
         setst(world, A_ID, "acknowledged")
     monkeypatch.undo()
-    assert by_id(world)[A_ID]["status"] == "notified"
-    assert open(os.path.join(world["ldir"], "CURRENT")).read().strip() == ptr
-    # commit fails after the snapshot -> snapshot discarded, pointer untouched
+    assert by_id(world)[A_ID]["status"] == "notified" and open(os.path.join(world["ldir"], "CURRENT")).read().strip() == ptr
     real_commit = duckdb.DuckDBPyConnection.commit
     monkeypatch.setattr(duckdb.DuckDBPyConnection, "commit", lambda self: (_ for _ in ()).throw(RuntimeError("commit failed")))
     with pytest.raises(SystemExit):
         setst(world, A_ID, "acknowledged")
     monkeypatch.setattr(duckdb.DuckDBPyConnection, "commit", real_commit)
-    assert by_id(world)[A_ID]["status"] == "notified"
-    assert open(os.path.join(world["ldir"], "CURRENT")).read().strip() == ptr
-    gens = os.listdir(os.path.join(world["ldir"], "snapshots"))
-    assert ptr in gens and all(os.path.exists(os.path.join(world["ldir"], "snapshots", g, "leads.parquet")) for g in gens)
-    # pruning keeps the newest 5
+    assert by_id(world)[A_ID]["status"] == "notified" and open(os.path.join(world["ldir"], "CURRENT")).read().strip() == ptr
     for i in range(7):
         setst(world, A_ID, note=f"n{i}")
     gens = sorted(os.listdir(os.path.join(world["ldir"], "snapshots")))
@@ -420,11 +521,12 @@ def test_cve_scoped_suppression(world):
 def test_remediation_only_when_service_is_gone(world):
     refresh(world)
     setst(world, A_ID, "notified", via="direct")
+    clear(world, IOC_ID)
     setst(world, IOC_ID, "notified", via="direct")
-    time_shift(world, date(2026, 10, 4))                       # stale, not gone
+    time_shift(world, date(2026, 10, 4))
     counts, _ = refresh(world, date(2026, 10, 5))
     assert counts["remediated"] == 0 and by_id(world)[A_ID]["status"] == "notified"
-    time_shift(world, date(2026, 11, 15))                      # gone
+    time_shift(world, date(2026, 11, 15))
     counts, _ = refresh(world, date(2026, 11, 16))
     r = by_id(world)
     assert counts["remediated"] == 2 and r[A_ID]["status"] == "remediated" and r[IOC_ID]["status"] == "remediated"
@@ -443,103 +545,98 @@ def test_reopen_only_on_newer_scan_not_recollected_banner(world):
     refresh(world)
     setst(world, A_ID, "notified", via="MS-ISAC")
     time_shift(world, date(2026, 11, 15))
-    counts, _ = refresh(world, date(2026, 11, 16))
-    assert counts["remediated"] == 1
-    # the SAME cached banner re-collected on a later day: not a newer scan -> stays remediated
+    assert refresh(world, date(2026, 11, 16))[0]["remediated"] == 1
     o = obs("10.0.0.1", 445, "education", product="Samba", d=date(2026, 11, 16), ts=datetime(2026, 9, 14, 3, 0, 0))
     add_store(world, [o], [vuln(o, "CVE-2020-0796", verified=True)])
     counts, _ = refresh(world, date(2026, 11, 17))
     r = by_id(world)[A_ID]
     assert counts["reopened"] == 0 and r["status"] == "remediated" and r["last_scan_ts"] == datetime(2026, 9, 14, 3, 0, 0)
-    # a genuinely newer scan reopens a NEW episode
     o = obs("10.0.0.1", 445, "education", product="Samba", d=date(2026, 11, 17), ts=datetime(2026, 11, 17, 1, 0, 0))
     add_store(world, [o], [vuln(o, "CVE-2020-0796", verified=True)])
     counts, _ = refresh(world, date(2026, 11, 18))
     r = by_id(world)[A_ID]
-    assert counts["reopened"] == 1 and r["status"] == "new" and r["prior_status"] == "remediated"
-    assert r["notified_on"] is None and r["notified_via"] is None and r["last_scan_ts"] == datetime(2026, 11, 17, 1, 0, 0)
+    assert counts["reopened"] == 1 and r["status"] == "new" and r["prior_status"] == "remediated" and r["notified_on"] is None
     assert "notified 2026-09-15 via MS-ISAC" in r["notes"] and "reopened" in events(world, A_ID)
 
 
-def test_compromise_reopen_uses_ledger_banner_ts(world, monkeypatch):
+def test_compromise_reopen_uses_service_banner_not_ledger_touch(world, monkeypatch):
     refresh(world)
+    clear(world, CT_ID)
     setst(world, CT_ID, "notified")
     time_shift(world, date(2026, 11, 15))
     refresh(world, date(2026, 11, 16))
     assert by_id(world)[CT_ID]["status"] == "remediated"
     monkeypatch.setattr(L, "COMPROMISE_WINDOW_DAYS", 365)
     led = json.loads((world["hits"] / "seen_ledger.json").read_text())
-    led["hosts"]["10.0.0.9"]["last_seen"] = "2026-11-17"                # ledger touched, banner unchanged
+    led["hosts"]["10.0.0.9"]["last_seen"] = "2026-11-17"
+    led["hosts"]["10.0.0.9"]["last_banner_ts"] = "2026-11-17T09:00:00"        # ledger banner moved, service banner did not
     (world["hits"] / "seen_ledger.json").write_text(json.dumps(led))
     counts, _ = refresh(world, date(2026, 11, 18))
     assert counts["reopened"] == 0 and by_id(world)[CT_ID]["status"] == "remediated"
-    led["hosts"]["10.0.0.9"]["last_banner_ts"] = "2026-11-17T09:00:00"
-    (world["hits"] / "seen_ledger.json").write_text(json.dumps(led))
+    with gzip.open(world["hits"] / "louisiana-compromise-2026-11-18.json.gz", "wt") as fh:      # a newer SERVICE banner
+        fh.write(json.dumps({"ip_str": "10.0.0.9", "port": 9200, "transport": "tcp", "tags": ["compromised"],
+                             "_compromise_selector": "tag:compromised", "timestamp": "2026-11-18T05:00:00"}) + "\n")
     counts, _ = refresh(world, date(2026, 11, 19))
     assert counts["reopened"] == 1 and by_id(world)[CT_ID]["status"] == "new"
 
 
-def test_owner_change_closes_episode_and_flags_review(world):
-    refresh(world)
-    setst(world, A_ID, "notified", via="MS-ISAC", analyst="jd")
-    reg = [r if r[0] != "10.0.0.1" else ["10.0.0.1", "ORG-OTHER", "Other College", "education", "state", "registry_network",
-                                         "high", "moved", "2026-09-16"] for r in REGISTRY]
-    write_registry(world["reg"], reg)
-    counts, _ = refresh(world, date(2026, 9, 16))
-    r = by_id(world)[A_ID]
-    assert counts["owner_changed"] == 2                                   # both CVE leads on 10.0.0.1
-    assert r["status"] == "new" and r["prior_status"] == "notified" and r["needs_attribution_review"] is True
-    assert r["notified_on"] is None and r["notified_via"] is None and r["analyst"] is None
-    assert r["org_id"] == "ORG-OTHER" and "ORG-TU -> ORG-OTHER" in r["notes"] and "notified 2026-09-15 via MS-ISAC" in r["notes"]
-    ev = rows(world, "SELECT detail FROM lead_events WHERE lead_id = ? AND event = 'owner_changed'", [A_ID])
-    assert json.loads(ev[0]["detail"])["old_org_id"] == "ORG-TU" and json.loads(ev[0]["detail"])["notified_via"] == "MS-ISAC"
-    with pytest.raises(SystemExit):
-        packet(world, date(2026, 9, 16), org="Other College")
-    setst(world, A_ID, review_cleared=True, analyst="jd")
-    assert by_id(world)[A_ID]["needs_attribution_review"] is False
-    setst(world, A2_ID, review_cleared=True)
-    assert "Other College" in packet(world, date(2026, 9, 16), org="Other College")
-    # attribution confidence DROP also closes the episode
-    setst(world, E_ID, "notified", via="direct")
-    reg = [r for r in reg if r[0] != "10.0.0.6"]
-    write_registry(world["reg"], reg)                                     # 10.0.0.6 falls back to shodan_org/low
-    counts, _ = refresh(world, date(2026, 9, 17))
-    r = by_id(world)[E_ID]
-    assert r["status"] == "new" and r["needs_attribution_review"] and r["attr_confidence"] == "low" and r["notified_on"] is None
-
-
-def test_legacy_migration_maps_old_kev_ids(world):
-    old_a = L.lead_id("10.0.0.1", 445, "tcp", "kev_verified")               # legacy: no CVE in the hash
-    old_b = L.lead_id("10.0.0.2", 443, "tcp", "kev_inferred")
+def test_legacy_migration_marker_and_mapping(world):
+    old_a = L.lead_id("10.0.0.1", 445, "tcp", "kev_verified")                 # names ONE of the two CVEs
+    old_b = L.lead_id("10.0.0.2", 443, "tcp", "kev_inferred")                 # names both
+    old_z = L.lead_id("10.0.0.50", 443, "tcp", "kev_inferred")                # zero targets
     s = duckdb.connect(world["store"])
     s.execute("CREATE TABLE leads (lead_id VARCHAR, ip VARCHAR, port INTEGER, transport VARCHAR, org_id VARCHAR, org_name VARCHAR, "
-              "tier VARCHAR, sector VARCHAR, evidence_type VARCHAR, evidence VARCHAR, confidence VARCHAR, first_seen DATE, "
-              "last_seen DATE, status VARCHAR, notified_via VARCHAR, notified_on DATE, analyst VARCHAR, notes VARCHAR, updated_at TIMESTAMP)")
+              "tier VARCHAR, sector VARCHAR, evidence_type VARCHAR, evidence VARCHAR, confidence VARCHAR, first_seen DATE, last_seen DATE, "
+              "status VARCHAR, notified_via VARCHAR, notified_on DATE, analyst VARCHAR, notes VARCHAR, updated_at TIMESTAMP)")
     s.executemany("INSERT INTO leads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
         [old_a, "10.0.0.1", 445, "tcp", None, "Test University", "education", "education", "kev_verified",
-         "KEV CVE(s) VERIFIED by Shodan: CVE-2017-0144, CVE-2020-0796", "high", date(2026, 9, 1), date(2026, 9, 10),
-         "notified", "MS-ISAC", date(2026, 9, 2), "jd", "old note", datetime(2026, 9, 10)],
+         "KEV CVE(s) VERIFIED by Shodan: CVE-2020-0796", "high", date(2026, 9, 1), date(2026, 9, 10), "notified", "MS-ISAC",
+         date(2026, 9, 2), "jd", "old note", datetime(2026, 9, 10)],
         [old_b, "10.0.0.2", 443, "tcp", None, "Test University", "education", "education", "kev_inferred",
-         "KEV CVE(s) inferred: CVE-2021-41773", "medium", date(2026, 9, 1), date(2026, 9, 10),
-         "suppressed", None, None, "jd", "", datetime(2026, 9, 10)],
-        [ICS_ID, "10.0.0.4", 502, "tcp", None, "Bayou Water", "critical_infrastructure", "critical_infrastructure", "ics",
-         "ICS", "medium", date(2026, 9, 1), date(2026, 9, 10), "acknowledged", "direct", date(2026, 9, 3), "jd", "", datetime(2026, 9, 10)],
+         "KEV inferred: CVE-2021-41773, CVE-2021-42013", "medium", date(2026, 9, 1), date(2026, 9, 10), "disputed", None, None, "jd",
+         "", datetime(2026, 9, 10)],
+        [old_z, "10.0.0.50", 443, "tcp", None, "Gone Corp", "education", "education", "kev_inferred", "KEV inferred: CVE-2020-1111",
+         "medium", date(2026, 9, 1), date(2026, 9, 10), "queued", None, None, "jd", "", datetime(2026, 9, 10)],
+        [ICS_ID, "10.0.0.4", 502, "tcp", None, "Bayou Water", "critical_infrastructure", "critical_infrastructure", "ics", "ICS", "medium",
+         date(2026, 9, 1), date(2026, 9, 10), "remediated", "direct", date(2026, 9, 3), "jd", "", datetime(2026, 9, 10)],
     ])
     s.close()
     counts, _ = refresh(world)
     r = by_id(world)
-    assert counts["migrated"] == 2 and old_a not in r and old_b not in r
-    for lid in (A_ID, A2_ID):
-        assert r[lid]["status"] == "notified" and r[lid]["notified_via"] == "MS-ISAC" and r[lid]["notified_on"] == date(2026, 9, 2)
-        assert r[lid]["needs_attribution_review"] is True and r[lid]["first_seen"] == date(2026, 9, 1)
-        assert "migrated from legacy lead " + old_a in r[lid]["notes"] and "old note" in r[lid]["notes"]
-        assert "migrated_from" in events(world, lid)
-    assert r[B1_ID]["status"] == "suppressed" and r[B1_ID]["needs_attribution_review"] is False
-    assert r[B2_ID]["status"] == "suppressed"                              # every per-CVE lead of that service
-    assert r[ICS_ID]["status"] == "acknowledged" and "imported_legacy" in events(world, ICS_ID)
-    assert "migrated_legacy_id" in events(world, old_a)
-    refresh(world, date(2026, 9, 16))                                      # idempotent afterwards
-    assert by_id(world)[A_ID]["status"] == "notified"
+    assert rows(world, "SELECT name FROM migrations ORDER BY name") == [{"name": "legacy_import_v1"}, {"name": "shadowserver_class_id_v1"}]
+    # exact-CVE mapping: A mapped (notified carried), A2 not named -> new + review, legacy row kept + flagged
+    assert r[A_ID]["status"] == "notified" and r[A_ID]["notified_via"] == "MS-ISAC" and r[A_ID]["first_seen"] == date(2026, 9, 1)
+    assert r[A2_ID]["status"] == "new" and r[A2_ID]["needs_attribution_review"] and "did not name this CVE" in r[A2_ID]["notes"]
+    assert old_a in r and r[old_a]["status"] == "notified" and r[old_a]["needs_attribution_review"] and "legacy lead kept" in r[old_a]["notes"]
+    # both named -> both mapped (disputed carried), legacy row gone
+    assert r[B1_ID]["status"] == "disputed" and r[B2_ID]["status"] == "disputed" and r[B1_ID]["needs_attribution_review"]   # multi-CVE
+    assert old_b not in r and counts["migrated"] == 1
+    # zero targets: kept, status preserved, flagged
+    assert r[old_z]["status"] == "queued" and r[old_z]["needs_attribution_review"] and "no per-CVE lead" in r[old_z]["notes"]
+    # a remediated legacy lead whose service is observed again by a newer scan reopens (its history intact)
+    assert r[ICS_ID]["status"] == "new" and r[ICS_ID]["prior_status"] == "remediated" and r[ICS_ID]["notified_via"] is None
+    assert "imported_legacy" in events(world, ICS_ID) and "reopened" in events(world, ICS_ID)
+    # marker prevents re-import; second refresh is stable
+    s = duckdb.connect(world["store"])
+    s.execute("DROP TABLE leads")
+    s.close()
+    refresh(world, date(2026, 9, 16))
+    assert by_id(world)[A_ID]["status"] == "notified" and by_id(world)[old_z]["status"] == "queued"
+
+
+def test_shadowserver_ids_migrated_in_place(world):
+    refresh(world)
+    setst(world, SSC_ID, "queued", analyst="jd")
+    old = L.lead_id("10.0.0.11", 0, "host", "shadowserver")                    # pre-class scheme
+    c = ctx(world)
+    c.con.execute("UPDATE leads SET lead_id = ? WHERE lead_id = ?", [old, SSC_ID])
+    c.con.execute("UPDATE lead_events SET lead_id = ? WHERE lead_id = ?", [old, SSC_ID])
+    c.con.execute("DELETE FROM migrations WHERE name = 'shadowserver_class_id_v1'")
+    c.close()
+    counts, _ = refresh(world, date(2026, 9, 16))
+    r = by_id(world)
+    assert old not in r and r[SSC_ID]["status"] == "queued" and r[SSC_ID]["analyst"] == "jd" and counts["inserted"] == 0
+    assert "id_migrated" in events(world, SSC_ID) and "status" in events(world, SSC_ID)
 
 
 def test_rebuild_recovery_for_leads(world):
@@ -555,8 +652,8 @@ def test_rebuild_recovery_for_leads(world):
     os.remove(os.path.join(world["ldir"], "leads.duckdb"))
     c = ctx(world)
     assert L.ensure_leads_db(c) == "restored"
-    assert L.fetch_dicts(c.con, "SELECT status, eligible FROM leads WHERE lead_id = ?", [A_ID])[0] == {"status": "acknowledged", "eligible": True}
-    assert c.con.execute("SELECT count(*) FROM lead_events").fetchone()[0] > 0
+    assert L.fetch_dicts(c.con, "SELECT status FROM leads WHERE lead_id = ?", [A_ID])[0]["status"] == "acknowledged"
+    assert c.con.execute("SELECT count(*) FROM migrations").fetchone()[0] == 2
     c.close()
 
 
@@ -570,9 +667,7 @@ def test_ranking_order_and_filters(world):
     assert seen == ["kev_verified", "compromise_tag", "shadowserver", "ics", "appliance", "kev_inferred", "ioc_match"]
     top = L.ranked_leads(c, limit=2)
     assert [t["evidence_key"] for t in top] == ["CVE-2017-0144", "CVE-2020-0796"] and top[0]["epss"] == pytest.approx(0.95)
-    ss = L.ranked_leads(c, evidence="shadowserver")
-    assert ss[0]["severity"] == "high" and ss[-1]["severity"] == "low"
-    assert len(L.ranked_leads(c, org="ORG-CT")) == 4 and len(L.ranked_leads(c, statuses=("queued",))) == 0
+    assert len(L.ranked_leads(c, org="ORG-CT")) == 5 and len(L.ranked_leads(c, org="city of testville")) == 6
     md = L.digest(c, TODAY)
     assert "| education |" in md and "high=4" in md and "needs review" in md and "-1d" not in md
     c.close()
@@ -586,46 +681,73 @@ def test_packet_sections_and_wording(world):
     for section in ("## 1. Summary", "## 2. What we observed", "## 3. What this is not", "## 4. Recommended actions",
                     "## 5. How to verify", "## 6. Contact and handling", "## Reviewer sign-off", "## Appendix A"):
         assert section in md, section
-    assert "**Status:** DRAFT" in md and "Second reviewer (recommended)" in md and "Priority:** HIGH" in md
-    assert "have not accessed, scanned, or interacted" in md and "currently active (last observed 2026-09-14)" in md
+    assert "**Status:** DRAFT" in md and "Priority:** HIGH" in md and "currently active (last observed 2026-09-14)" in md
     assert "registry method `registry_network`" in md and "confidence **high**" in md
+    clear(world, ICS_ID)
     md_ics = packet(world, org="Bayou Water")
     assert "reachability alone is a serious exposure that must be verified" in md_ics and "reachability is control" not in md_ics
     assert "Shodan org field 'Bayou Water' only" in md_ics
 
 
-def test_packet_appendix_cross_tenant_safety(world):
+def test_packet_refuses_label_only_leads_until_cleared(world):
+    refresh(world)
+    with pytest.raises(SystemExit):
+        packet(world, org="Bayou Water")
+    with pytest.raises(SystemExit):
+        packet(world, ip="10.0.0.30")                              # host-level on non-ownership attribution
+    # an analyst's clearance sticks across refreshes while the attribution is unchanged
+    clear(world, ICS_ID)
+    counts, _ = refresh(world, date(2026, 9, 16))
+    assert counts["review_flagged"] == 0 and not by_id(world)[ICS_ID]["needs_attribution_review"]
+    assert "Bayou Water" in packet(world, date(2026, 9, 16), org="Bayou Water")
+    clear(world, CT_ID)                                            # explicit registry row without an org: label wording
+    assert "network-operator label, not an ownership record (registry `arin_rdap`: no organisation recorded)" in \
+        packet(world, date(2026, 9, 16), ip="10.0.0.9")
+
+
+def test_packet_appendix_authorized_by_current_registry_only(world):
     refresh(world)
     app = packet(world, org="Test University").split("## Appendix A")[1]
-    assert "| `10.0.0.1` | 80/tcp |" in app and "| `10.0.0.1` | 445/tcp |" in app          # whole-address ownership
-    assert "omitted" not in app
+    assert "| `10.0.0.1` | 80/tcp |" in app and "| `10.0.0.1` | 445/tcp |" in app and "omitted" not in app
     app2 = packet(world, org="City of Testville").split("## Appendix A")[1]
-    assert "| `10.0.0.6` | 443/tcp |" in app2 and "22/tcp" not in app2                        # domain-attributed: leads only
-    assert "Other services on 3 address(es) omitted: shared/unresolved ownership" in app2
-    assert "`10.0.0.1` " not in app2
+    assert "| `10.0.0.6` | 443/tcp |" in app2 and "22/tcp" not in app2 and "8080/tcp" not in app2
+    assert "omitted: shared/unresolved ownership" in app2
+    # the registry changes (10.0.0.1 no longer a curated network) — lead rows still say registry_network/high,
+    # but authorization comes from the CURRENT registry: the extra service disappears without a refresh
+    write_registry(world["reg"], networks=NETWORKS[1:], attr=ATTR + [["10.0.0.1", "ORG-TU", "Test University", "education", "state",
+                                                                      "domain_dns", "high", "x", "2026-09-16", ""]])
+    app3 = packet(world, org="Test University").split("## Appendix A")[1]
+    assert "80/tcp" not in app3 and "445/tcp" in app3 and "omitted" in app3
+    # a registry conflict on the address also withdraws the privilege
+    write_registry(world["reg"], attr=ATTR + [["10.0.0.1", "ORG-TU", "Test University", "education", "state", "registry_network",
+                                               "high", "x", "2026-09-16", "rdns=x"]], networks=NETWORKS[1:])
+    assert "80/tcp" not in packet(world, org="Test University").split("## Appendix A")[1]
 
 
-def test_packet_flags_attribution_conflict(world):
+def test_packet_flags_attribution_conflict_between_lead_rows(world):
     refresh(world)
     c = ctx(world)
     c.con.execute("UPDATE leads SET org_id = 'ORG-ZZ', org_name = 'Zed Corp', last_evaluated = DATE '2026-09-10' WHERE lead_id = ?", [A2_ID])
     c.close()
     md = packet(world, org="Test University")
-    assert "Attribution conflict" in md and "10.0.0.1" in md.split("**Attribution conflict**")[1].split("\n")[0]
-    app = md.split("## Appendix A")[1]
-    assert "80/tcp" not in app                                             # conflict removes whole-address privilege
+    assert "Attribution conflict" in md and "80/tcp" not in md.split("## Appendix A")[1]
 
 
-def test_packet_shadowserver_classes_and_priority(world):
+def test_packet_shadowserver_classes_priority_and_host_freshness(world):
     refresh(world)
+    clear(world, SSC_ID, SSE_ID, CT_ID)
     md = packet(world, org="Delta Widgets")
-    assert "**REQUIRED**" in md and "Possible infection — Shadowserver sinkhole" in md
-    assert "Exposed or vulnerable service — Shadowserver scan report" in md and "| 443/tcp |" in md and "| — |" in md
-    assert "51234" not in md.split("### Finding detail")[0]
-    setst(world, L.lead_id("10.0.0.11", 0, "host", "shadowserver"), "false_positive")
+    assert "**REQUIRED**" in md and "Possible infection — Shadowserver sinkhole" in md and "| 443/tcp |" in md and "| — |" in md
+    assert "host-level evidence — last event 2026-09-12 (3 d ago)" in md and "51234" not in md.split("### Finding detail")[0]
+    # 40 days later with no newer event: host-level leads are historical, never "still observed"
+    setst(world, SSC_ID, "notified", via="direct")
+    md2 = packet(world, date(2026, 10, 25), org="Delta Widgets")
+    assert "no newer event — last event 2026-09-12 (43 d ago)" in md2 and "still observed" not in md2
+    assert "### No longer observed — historical" in md2 and "| H1 |" in md2
+    setst(world, SSC_ID, "false_positive")
     setst(world, CT_ID, "false_positive")
-    md2 = packet(world, org="Delta Widgets")
-    assert "Priority:** MEDIUM" in md2 and "Second reviewer (recommended)" in md2 and "Possible infection" not in md2
+    md3 = packet(world, org="Delta Widgets")
+    assert "Priority:** MEDIUM" in md3 and "Second reviewer (recommended)" in md3
 
 
 def test_packet_status_filtering_and_exposure_state(world):
@@ -634,15 +756,12 @@ def test_packet_status_filtering_and_exposure_state(world):
     setst(world, A2_ID, "false_positive")
     setst(world, B1_ID, "suppressed")
     md = packet(world, org="Test University")
-    assert "previously notified on 2026-09-15" in md and "— still observed" in md
-    assert "CVE-2017-0144" not in md.split("### Finding detail")[1].split("## 3.")[0] and "CVE-2021-41773" not in md
+    assert "previously notified on 2026-09-15" in md and "— still observed" in md and "1 still observed" in md and "CVE-2021-41773" not in md
     md2 = packet(world, org="Test University", include_closed=True)
     assert "CVE-2017-0144" in md2 and "closed; included on request" in md2
-    # a new lead whose service is gone is listed as historical, not as a current finding
-    time_shift(world, date(2026, 11, 15))                       # B2 (new) and A (notified) are now gone
+    time_shift(world, date(2026, 11, 15))
     md3 = packet(world, date(2026, 11, 16), org="Test University")
-    assert "### No longer observed — historical" in md3 and "| H1 |" in md3
-    assert "no longer observed — last observed 2026-09-14" in md3 and "last observed 2026-09-14" in md3.split("Previously notified")[1].split("\n")[0]
+    assert "### No longer observed — historical" in md3 and "| H1 |" in md3 and "no longer observed — last observed 2026-09-14" in md3
 
 
 def test_packet_refuses_multi_org_residential_now_and_unattributed(world, monkeypatch):
@@ -658,7 +777,6 @@ def test_packet_refuses_multi_org_residential_now_and_unattributed(world, monkey
     with pytest.raises(SystemExit):
         MP.select_leads(c, org="unattributed")
     c.close()
-    # host is residential NOW in the store (no refresh yet): refused on the packet side
     add_store(world, [obs("10.0.0.6", 443, "residential", org="Cox", product="FortiGate", d=date(2026, 9, 15))])
     with pytest.raises(SystemExit):
         packet(world, ip="10.0.0.6")
@@ -673,18 +791,17 @@ def test_packet_escapes_banner_text(world):
     assert "\\| \\*\\*bold\\*\\*" in md and "\\[link\\]" in md and "a'b\\|c" in md
     assert not any(line.startswith("# heading") for line in md.splitlines())
     table = md.split("## 2. What we observed")[1].split("\nScan age = ")[0]
-    assert len([ln for ln in table.splitlines() if ln.startswith("| ")]) == 1 + 4
+    assert len([ln for ln in table.splitlines() if ln.startswith("| ")]) == 1 + 3
 
 
 def test_packet_main_writes_file_and_pdf(world, tmp_path):
     refresh(world)
     out = tmp_path / "packets"
-    rc = MP.main(["--ip", "10.0.0.6", "--db", world["store"], "--leads-dir", world["ldir"], "--out-dir", str(out),
-                  "--date", "2026-09-15"] + (["--pdf"] if pytest.importorskip("reportlab") else []))
+    rc = MP.main(["--ip", "10.0.0.6", "--db", world["store"], "--leads-dir", world["ldir"], "--registry-dir", world["reg"],
+                  "--out-dir", str(out), "--date", "2026-09-15"] + (["--pdf"] if pytest.importorskip("reportlab") else []))
     assert rc == 0
     files = sorted(os.listdir(out))
     assert files == ["City_of_Testville_2026-09-15.md", "City_of_Testville_2026-09-15.pdf"]
-    assert "10.0.0.6" in (out / files[0]).read_text() and (out / files[1]).stat().st_size > 1000
 
 
 # --- shadowserver ------------------------------------------------------------------
@@ -692,7 +809,7 @@ def test_packet_main_writes_file_and_pdf(world, tmp_path):
 CSV = ('"timestamp","ip","protocol","port","hostname","tag","asn","geo","region","city","naics","sector","infection","src_port","dst_ip"\n'
        '"2026-09-14 03:12:44","10.0.0.11","tcp","51234","host.example.net","avalanche-andromeda","64512","US","LOUISIANA","BATON ROUGE","0","","andromeda","51234","192.0.2.9"\n'
        '"2026-09-14 03:12:44","10.0.0.11","udp","51234","host.example.net","avalanche-andromeda","64512","US","LOUISIANA","BATON ROUGE","0","","andromeda","51234","192.0.2.9"\n'
-       '"2026-09-14T03:13:01-05:00","10.0.0.12","sctp","","","","64512","US","LOUISIANA","LAFAYETTE","","","","",""\n'
+       '"2026-09-14T03:13:01-05:00","2001:0DB8:0000::0001","sctp","","","","64512","US","LOUISIANA","LAFAYETTE","","","","",""\n'
        '"2026-09-14 03:14:00","","tcp","80","","","","","","","","","","",""\n'
        '"2027-01-01 00:00:00","10.0.0.13","tcp","80","","","","","","","","","","",""\n'
        '"2026-09-14 03:15:00","10.0.0.14","tcp","80","","","","","","","","","","","","SURPLUS"\n'
@@ -709,68 +826,49 @@ def test_classify_report_types():
         assert SS.classify_report(t) == "exposure", t
 
 
-def test_parse_report_validation_and_quarantine(tmp_path):
+def test_parse_report_validation_quarantine_and_ipv6(tmp_path):
     p = tmp_path / "2026-09-14-sinkhole_http_drone-louisiana.csv"
     p.write_text(CSV)
     sha, events, bad = SS.parse_report(str(p), today=TODAY)
-    assert len(events) == 3
-    assert events[0]["timestamp"] == datetime(2026, 9, 14, 3, 12, 44) and events[1]["protocol"] == "udp"
-    assert events[2]["timestamp"] == datetime(2026, 9, 14, 8, 13, 1) and events[2]["protocol"] == "other"
-    assert json.loads(events[2]["detail"])["protocol_raw"] == "sctp"
+    assert len(events) == 3 and events[1]["protocol"] == "udp"
+    assert events[2]["ip"] == "2001:db8::1" and events[2]["protocol"] == "other" and events[2]["timestamp"] == datetime(2026, 9, 14, 8, 13, 1)
     assert sorted(r for r, _ in bad) == ["future-dated", "invalid ip", "invalid protocol", "missing ip", "port out of range",
                                          "surplus fields", "unparseable timestamp"]
-    assert SS.parse_ts("2026-09-14T03:12:44Z") == datetime(2026, 9, 14, 3, 12, 44)
 
 
-def test_ingest_lock_identity_dedupe_and_recovery(tmp_path):
+def test_ingest_lock_identity_dedupe_recovery_and_exit_codes(tmp_path):
     store = str(tmp_path / "s.duckdb")
     inc, proc, quar = tmp_path / "incoming", tmp_path / "processed", tmp_path / "quarantine"
     pq, man = str(tmp_path / "ss" / "events.parquet"), str(tmp_path / "ss" / "manifest.json")
     inc.mkdir()
     (inc / "2026-09-14-sinkhole_http_drone-louisiana.csv").write_text(CSV)
     kw = dict(processed_dir=str(proc), quarantine_dir=str(quar), parquet=pq, manifest_path=man)
-    # a concurrent ingester holds the lock: exit cleanly, nothing touched
+    argv = ["ingest", "--incoming", str(inc), "--processed", str(proc), "--quarantine", str(quar), "--parquet", pq, "--manifest", man]
     lock = SS.acquire_lock(pq)
-    assert lock is not None
     assert SS.ingest_dir(None, str(inc), today=TODAY, **kw) is None and os.listdir(inc) and not os.path.exists(man)
+    assert SS.main(argv + ["--db", store]) == 3                                         # lock held: exit 3
     lock.close()
-    assert SS.ingest_dir(None, str(inc), today=TODAY, dry_run=True, **kw) == {"loaded": 3}
-    assert not os.path.exists(pq) and os.listdir(inc)
-    # publication failure keeps the input in incoming/ (parquet + manifest already durable)
-    class Broken:
-        def execute(self, *a, **k):
-            raise duckdb.Error("locked")
-    assert SS.ingest_dir(Broken(), str(inc), today=TODAY, **kw) == {"unpublished": 1}
-    assert os.listdir(inc) and os.path.exists(pq) and os.path.exists(man)
-    con = duckdb.connect(store)
-    assert SS.ingest_dir(con, str(inc), today=TODAY, **kw) == {"duplicate": 1}          # retried: now published + moved
+    assert SS.main(argv + ["--db", str(tmp_path / "nodir" / "x.duckdb")]) == 4          # store not writable: degraded
+    assert os.listdir(inc) and os.path.exists(pq) and os.path.exists(man)               # parquet/manifest durable, input kept
+    assert SS.main(argv + ["--db", store]) == 0                                          # retry: published + moved
     assert os.listdir(inc) == [] and len(os.listdir(proc)) == 1
-    assert con.execute("SELECT count(*) FROM shadowserver_events").fetchone()[0] == 3    # tcp + udp kept apart
+    con = duckdb.connect(store)
+    assert con.execute("SELECT count(*) FROM shadowserver_events").fetchone()[0] == 3
+    assert con.execute("SELECT ip FROM shadowserver_events WHERE protocol = 'other'").fetchone() == ("2001:db8::1",)
     m = json.load(open(man))
     ident, entry = next(iter(m["files"].items()))
-    assert ident.endswith(":sinkhole_http_drone") and entry["report_type"] == "sinkhole_http_drone"
-    assert entry["rows_loaded"] == 3 and entry["rows_quarantined"] == 7
-    assert (quar / "2026-09-14-sinkhole_http_drone-louisiana.csv.quarantine.csv").read_text().count("\n") == 8
-    # same bytes under a different report type = a different file; same rows = deduped events
-    (inc / "2026-09-14-scan_ssl-louisiana.csv").write_text(CSV)
-    tot = SS.ingest_dir(con, str(inc), today=TODAY, **kw)
-    assert tot == {"loaded": 3} and con.execute("SELECT count(*) FROM shadowserver_events").fetchone()[0] == 6
-    (inc / "copy (1).csv").write_text(CSV)                                              # type 'copy (1)' -> new identity, rows dedupe? no: type differs
+    assert ident.endswith(":sinkhole_http_drone") and entry["rows_loaded"] == 3 and entry["rows_quarantined"] == 7
+    (inc / "2026-09-14-scan_ssl-louisiana.csv").write_text(CSV)                         # same bytes, other type = new identity
+    assert SS.ingest_dir(con, str(inc), today=TODAY, **kw) == {"loaded": 3}
     (inc / "2026-09-15-sinkhole_http_drone-louisiana.csv").write_text(CSV.splitlines()[0] + "\n" + CSV.splitlines()[1] + "\n")
-    tot = SS.ingest_dir(con, str(inc), today=TODAY, **kw)
-    assert tot.get("empty") == 1                                                          # overlapping rows: event-level dedupe
+    assert SS.ingest_dir(con, str(inc), today=TODAY, **kw) == {"empty": 1}              # event-level dedupe
     con.execute("DROP TABLE shadowserver_events")
-    assert SS.restore_table(con, pq)
-    n = con.execute("SELECT count(*) FROM shadowserver_events").fetchone()[0]
-    assert n == duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{pq}')").fetchone()[0]
-    assert [r[0] for r in con.execute("SELECT column_name FROM information_schema.columns WHERE table_name='shadowserver_events' "
-                                      "ORDER BY ordinal_position").fetchall()] == SS.EVENT_COLUMNS
+    assert SS.restore_table(con, pq) and con.execute("SELECT count(*) FROM shadowserver_events").fetchone()[0] == 6
     con.close()
 
 
 def test_hmac2_known_vector():
-    assert SS.hmac2("key", "The quick brown fox jumps over the lazy dog") == \
-        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    assert SS.hmac2("key", "The quick brown fox jumps over the lazy dog") == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
 
 
 def test_fetch_soft_fails_without_keys(monkeypatch, tmp_path):

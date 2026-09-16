@@ -19,7 +19,7 @@ that file is disposable, so:
 
 | What | Authoritative location | Copy in `exposure.duckdb` |
 |---|---|---|
-| leads + event log | `store/leads/leads.duckdb` (tables `leads` — `lead_id` PRIMARY KEY — and `lead_events`) | table `leads`, re-published by every `refresh`/`set` — a convenience copy |
+| leads + event log | `store/leads/leads.duckdb` (tables `leads` — `lead_id` PRIMARY KEY —, `lead_events`, `migrations`) | table `leads`, re-published by every `refresh`/`set` — a convenience copy |
 | lead snapshots | `store/leads/snapshots/<generation>/{leads,lead_events}.parquet`; `store/leads/CURRENT` names the generation to restore from; the newest 5 are kept | — |
 | Shadowserver events | `store/shadowserver/events.parquet` + `store/shadowserver/manifest.json` | table `shadowserver_events`, re-published by every `ingest` run and by `restore`; **`leads.py` reads the parquet, never the table** |
 
@@ -29,14 +29,19 @@ a new snapshot generation (nothing existing is replaced), then publishes
 snapshot **inside** its transaction, before commit; if the snapshot fails the
 change is rolled back and reported as not saved; if the commit fails the
 snapshot is discarded and `CURRENT` is untouched. If `leads.duckdb` is lost,
-`refresh` restores from the generation `CURRENT` names. **Migration:** the first
-run on a fresh `leads.duckdb` imports a legacy `leads` table from the store
-transactionally and maps old KEV lead ids (no CVE in the hash) onto the new
-per-CVE leads: a legacy lead in suppressed / false_positive / notified /
-acknowledged passes its status (and notification fields) to every per-CVE lead
-of that service that exists at migration time, with a `migrated_from` event; if
-the legacy lead covered more than one CVE the new leads are flagged
-`needs_attribution_review`.
+`refresh` restores from the generation `CURRENT` names. **Migrations** are
+recorded in the `migrations(name, applied_at, detail)` table and run once:
+`legacy_import_v1` imports a legacy `leads` table from the store transactionally
+(rows whose ids are not present yet); `shadowserver_class_id_v1` re-keys
+Shadowserver leads in place (the report class is now part of the id; events
+follow, `id_migrated` logged). Legacy KEV ids (no CVE in the hash) are then
+mapped onto the per-CVE leads of the same service **only where the legacy
+evidence text names exactly that CVE** — every status is carried (queued,
+disputed, remediated included; a remediated legacy lead re-observed by a newer
+scan reopens like any other); a per-CVE lead the legacy evidence did not name is
+created `new` with `needs_attribution_review`; a legacy row with no target (or
+not fully mapped) is **kept**, status preserved, flagged and noted — never
+deleted.
 
 ## Vocabulary
 
@@ -46,9 +51,11 @@ the legacy lead covered more than one CVE the new leads are flagged
 | **host-level lead** | `port 0`, `transport 'host'` — a threat-intel listing, a compromise flag whose archive carries no port, every Shadowserver *compromise*-class event (its `port` column is the infected host's **source** port, never an exposed service) |
 | **tier** | the host's consequence tier from its **newest observation** in `latest_observed`; for a host not in the store, derived from the registry sector |
 | **eligible / eligibility_reason** | decided once per ip per refresh from that tier: `residential` and `honeypot` hosts are never notification targets. Ineligibility **never changes status** — the lead is hidden from `list`/packets/digest (`list --include-ineligible` shows it); `prior_status` records the status at the flip; when the host is eligible again the lead simply reappears with its status intact (a `false_positive` stays a `false_positive`) |
-| **attribution** (`org_id`, `org_name`, `sector`, `attr_method`, `attr_confidence`) | registry `ip_attribution.parquet` as recorded → the store's `attr_*` columns → Shodan `org` as `shodan_org`/`low` → `unattributed`/`none`. Carried separately from evidence confidence |
-| **owner change** | between refreshes the attributed `org_id` changes (both non-empty) **or** attribution confidence drops: the notification episode is closed (`owner_changed` event with the old org and notification history), status → `new` (`prior_status` kept), `notified_on`/`notified_via`/`analyst` cleared, `needs_attribution_review = true`. Packets refuse the lead until `set <id> --review-cleared` |
-| **whole-address ownership** | `attr_method` in `ots_cidr` / `registry_network` with `high` confidence — the only case in which a packet may list *other* services on the address |
+| **attribution** (`org_id`, `org_name`, `sector`, `attr_method`, `attr_confidence`, `attr_conflict`) | from the **published registry generation** (`store/registry/CURRENT` via `registry.Attributor`). Three outcomes: registry **unavailable** (no generation / no rows) → every lead keeps its previous org fields untouched, a brand-new lead carries the Shodan operator label (`shodan_org`, low, review) and the run logs it; an **explicit row with no org** (e.g. a lone `arin_rdap` observation) is authoritative → it replaces older store-derived ownership; the lead shows the operator label, low, review; an **attributed row** → whole-address methods bind every service; any other method (domain_dns, cert, roster_name, registry_asn …) binds a lead only if the lead's own observation carries a hostname / certificate name under one of the org's registry domains (`Attributor.lookup_domain`) or the org name in `cert_org`; otherwise the lead keeps the operator label, `attr_method = unbound(<method>)`, low, review. Host-level evidence on a non-ownership attribution keeps the org but is flagged. A non-empty registry `conflict` is carried as `attr_conflict` and flags the lead |
+| **owner change** | reconciled for **every** lead each refresh (candidates or not, eligible or not): `org_id` changes — including empty ↔ non-empty — or attribution confidence drops → the episode is closed (`owner_changed` event with the old org and notification history), status → `new` (`prior_status` kept), `notified_on`/`notified_via`/`analyst` cleared, `needs_attribution_review`. `org_at_first_seen` keeps the ownership recorded when the lead was raised |
+| **needs_attribution_review** | set by refresh as above; an analyst clears it with `set <id> --review-cleared` (re-flag with `--needs-review`). A clearance sticks: refresh re-flags only when the attribution itself changes (method / org / conflict) |
+| **whole-address ownership** | `ots_cidr` / `registry_network` with `high` confidence and no conflict **in the current registry** — the only case in which a packet may list *other* services on the address |
+| **last_event** | host-level leads: the date of the newest event (ledger `last_seen`, Shadowserver event); older than 30 days without a newer event = historical, never "still observed" |
 | **first_seen / last_evaluated** | refresh dates: when the lead was first raised / last looked at |
 | **last_seen / last_scan_ts** | the newest **scan** supporting the lead: `banner_ts` (collection date only when `banner_ts` is null); the tripwire ledger's `last_banner_ts`; the Shadowserver event time. A re-collected cached banner is not a newer scan |
 | **severity / evidence_key** | the evidence's own severity; the CVE, appliance label, tripwire selectors, `compromise:<types>` / `exposure:<types>`, IOC feeds |
@@ -83,8 +90,8 @@ and logged to `lead_events(ts, lead_id, event, detail)` (`created`, `status`,
 | evidence_type | confidence | rule | tiers |
 |---|---|---|---|
 | `kev_verified` | high | a CISA-KEV CVE that Shodan itself **verified** on the host; one lead per CVE | all eligible |
-| `compromise_tag` | high | host in `compromise_hits/seen_ledger.json` with `last_seen` in the last **30 days**; port/transport from the hit archives, else host-level; scan time = ledger `last_banner_ts` | all eligible |
-| `shadowserver` | high (compromise) / medium (exposure) | an event in `store/shadowserver/events.parquet` in the last **14 days**. Compromise-class (sinkhole / drone / microsoft_sinkhole / spam / compromised_website / malware_url / botnet / cc …) → host-level, "possible infection" wording. Exposure-class (scan_* / vulnerable_* / exposed_* / open_* / accessible_* / ics / blocklist …) → per exposed port, "exposure to verify" wording. Unknown types → exposure (the weaker claim) | all eligible |
+| `compromise_tag` | high | host in `compromise_hits/seen_ledger.json` with `last_seen` in the last **30 days**; per-service leads from the hit archives carry **that service's** `banner_ts`; the host-level lead (no archived port) carries the ledger's `last_banner_ts` | all eligible |
+| `shadowserver` | high (compromise) / medium (exposure) | an event in `store/shadowserver/events.parquet` in the last **14 days**; the report class is part of the lead id. Compromise-class (sinkhole / drone / microsoft_sinkhole / spam / compromised_website / malware_url / botnet / cc …) → host-level, "possible infection" wording. Exposure-class (scan_* / vulnerable_* / exposed_* / open_* / accessible_* / ics / blocklist …) → per exposed port, "exposure to verify" wording. Unknown types → exposure (the weaker claim) | all eligible |
 | `ics` | medium | an ICS scan module, an ICS port (`triage_report.ICS_PORTS`) or Shodan's `ics` tag — never on a honeypot | all eligible |
 | `appliance` | medium | `build_store.APPLIANCE_PATTERNS` — the **same** regex list the `appliance_exposure` view uses — over product / cpe23 / http_title | priority tiers only |
 | `kev_inferred` | medium | a KEV CVE inferred from the banner version, **not** verified; one lead per CVE | priority tiers only |
@@ -106,15 +113,17 @@ venv/bin/python leads.py list --tier government --status new
 venv/bin/python leads.py list --org "ORG-CT" --include-ineligible
 venv/bin/python leads.py set <lead_id> --status notified --via MS-ISAC --analyst jd --note "packet LA-EXP-..."
 venv/bin/python leads.py set <lead_id> --status acknowledged --note "CISO replied"
-venv/bin/python leads.py set <lead_id> --review-cleared --analyst jd     # after confirming a changed attribution
+venv/bin/python leads.py set <lead_id> --review-cleared --analyst jd     # after confirming the attribution
+venv/bin/python leads.py set <lead_id> --needs-review --note "..."         # send it back for review
 venv/bin/python leads.py digest                  # per-sector counts, needs-review, attribution mix, remediation stats
 venv/bin/python leads.py digest --weekly --out reports/leads_digest_$(date +%F).md
 ```
 
 `refresh` prints a per tier / evidence / status summary of eligible leads, the
 hidden (ineligible) and needs-review counts, the attribution-confidence mix and
-the excluded aggregates. Options `--leads-dir`, `--ledger`, `--hits-dir`,
-`--ioc`, `--attribution`, `--ss-parquet`, `--today` exist for tests.
+the excluded aggregates. Options `--leads-dir`, `--registry-dir`, `--ledger`, `--hits-dir`,
+`--ioc`, `--ss-parquet`, `--today` exist for tests. IPs are canonicalised
+(`ipaddress … .compressed`) in every key so IPv6 spellings match the store.
 
 ### The digest — measuring remediation
 
@@ -151,15 +160,19 @@ have no authentication; reachability alone is a serious exposure that must be
 verified"); how to verify; contact/handling; reviewer sign-off; Appendix A.
 
 Refusals (all re-checked in `make_packet`, independently of `leads.py`):
-ineligible leads; leads flagged `needs_attribution_review`; leads whose host's
-**current** tier in `latest_observed` is residential/honeypot; more than one
-attributed organisation among the selected leads (listed); `--org unattributed`.
-Lead rows on one address are read in `last_evaluated` order and a disagreement
-on the owner is reported as an **attribution conflict** (never "last row
-wins"). **Cross-tenant safety:** Appendix A always lists the lead services; it
-lists *other* services on an address only when that address has whole-address
-ownership recorded for the recipient, otherwise it says "other services on this
-address omitted: shared/unresolved ownership". Attribution is stated as recorded
+ineligible leads; leads flagged `needs_attribution_review` (including registry
+conflicts) until cleared; leads whose host's **current** tier in
+`latest_observed` is residential/honeypot; more than one attributed organisation
+among the selected leads (listed); `--org unattributed`. Lead rows on one
+address are read in `last_evaluated` order and a disagreement on the owner is
+reported as an **attribution conflict** (never "last row wins"). Any open lead
+whose service is `gone` — or whose host-level event is older than 30 days — is
+listed under "no longer observed — historical" with its last observation.
+**Cross-tenant safety:** Appendix A always lists the lead services; it lists
+*other* services on an address only when the **current registry generation**
+(looked up at packet time with `--registry-dir`, never from historical lead
+rows) records whole-address ownership for the recipient, otherwise it says
+"other services on this address omitted: shared/unresolved ownership". Attribution is stated as recorded
 (registry method/confidence; Shodan org shown as a low-confidence label; else
 "unattributed" — never promoted from a certificate name). Every external string
 (ip, port, transport, product, title, hostnames, org, evidence, dates, ids) is
@@ -182,7 +195,10 @@ venv/bin/python ingest_shadowserver.py fetch --date 2026-09-14 [--types sinkhole
 One `ingest` run holds `store/shadowserver/.ingest.lock` (`fcntl.flock`) from
 manifest read through dedupe, parquet publish, manifest write and input move; a
 second ingester exits cleanly with code 3 (or waits with `--wait`) and never
-proceeds without the lock. File identity is `<sha256>:<report_type>` (report
+proceeds without the lock. Exit code **4 = degraded**: a file errored or could
+not be published, or the final store republish failed — the parquet and
+manifest are intact; `run_nightly` should mark the night degraded. IPs are
+canonicalised at ingest. File identity is `<sha256>:<report_type>` (report
 type from the original filename, recorded in the manifest — never from the
 processed name); events dedupe on `(report_type, timestamp, ip, port, protocol,
 tag)`. Each file is all-or-nothing: parquet written to a pid-unique temp file

@@ -344,11 +344,26 @@ class Attributor:
         (curated/OTS CIDRs are the strongest evidence and may be newer than the
         last build), then the precomputed ip_attribution row. None if unknown.
         A precomputed row with no org_id (e.g. a lone cymru_asn observation) is
-        still returned — its evidence tells the analyst which network it is on."""
+        still returned — its evidence tells the analyst which network it is on.
+        A conflict recorded at build time is never lost on the live-prefix path:
+        it is merged into the hit (confidence capped at medium), and a build-time
+        prefix attribution to a DIFFERENT org than the live prefix is itself a
+        conflict ('live_prefix=la-a;built_prefix=la-b')."""
         hit = self._network_hit(ip)
-        if hit:
-            return hit
         row = self.attribution.get(ip)
+        if hit:
+            if row:
+                notes = []
+                built_org = str(row.get("org_id") or "")
+                if (str(row.get("method") or "") in ("ots_cidr", "registry_network")
+                        and built_org and built_org != hit["org_id"]):
+                    notes.append(f"live_prefix={hit['org_id']};built_prefix={built_org}")
+                if row.get("conflict"):
+                    notes.append(str(row["conflict"]))
+                if notes:
+                    hit["conflict"] = ";".join(notes)
+                    hit["confidence"] = min_conf(hit["confidence"], "medium")
+            return hit
         if row is None:
             return None
         return {k: ("" if row.get(k) is None else str(row.get(k))) for k in ATTR_COLS if k != "ip"}

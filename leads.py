@@ -9,64 +9,66 @@ carries one specific, evidence-graded reason to contact its owner:
   evidence_type    confidence  rule (see generate_candidates)
   kev_verified     high        a CISA-KEV CVE that Shodan itself VERIFIED on the host (one lead per CVE)
   compromise_tag   high        the host is in compromise_hits/seen_ledger.json (Shodan's
-                               compromised/malware/c2/botnet flags) seen in the last 30 days
+                               compromised/malware/c2/botnet flags) seen in the last 30 days;
+                               per-service leads carry that service's banner_ts, the host-level
+                               lead the ledger's last_banner_ts
   shadowserver     high|medium a Shadowserver event for the ip in the last 14 days, read from the
                                authoritative store/shadowserver/events.parquet — COMPROMISE-class
-                               reports are high and host-level; EXPOSURE-class are medium, per port
+                               reports are high and host-level; EXPOSURE-class are medium, per port;
+                               the class is part of the lead identity
   ics              medium      an ICS protocol module or ICS port answering (non-honeypot)
-  appliance        medium      an internet-edge appliance per build_store.APPLIANCE_PATTERNS (the
-                               same definitions as the appliance_exposure view) — priority tiers only
-  kev_inferred     medium      a KEV CVE inferred from the banner version, NOT verified — priority
-                               tiers only (one lead per CVE)
-  ioc_match        medium      the host appears in the store's ioc_matches view (exact ip hits AND
-                               CIDR-range hits such as Spamhaus DROP) — host-level
+  appliance        medium      an internet-edge appliance per build_store.APPLIANCE_PATTERNS — priority tiers
+  kev_inferred     medium      a KEV CVE inferred from the banner version, NOT verified — priority tiers
+  ioc_match        medium      the host appears in the store's ioc_matches view (exact ip AND CIDR hits)
   cred_leak        (reserved for a later feed; accepted by `set`, never generated here)
 
-ELIGIBILITY is modelled separately from status. Once per ip per refresh the host's
-CURRENT tier (newest observation in latest_observed; registry sector for a host not
-in the store) decides `eligible` + `eligibility_reason`: residential and honeypot
-hosts are never notification targets. An ineligible lead KEEPS its status (an analyst's
-false_positive/disputed/suppressed decision is never destroyed); it is only hidden
-from list/packets/digest by default, and `prior_status` records what it was when it
-became ineligible. Nothing is ever unconditionally reset to `new`.
+ELIGIBILITY (`eligible`, `eligibility_reason`, `prior_status`) is separate from
+status: residential/honeypot hosts are never notification targets, but an
+ineligible lead keeps its status and is only hidden from list/packets/digest.
 
-IDENTITY: lead_id = sha1(ip|port|transport|evidence_type[|cve])[:16] — the CVE is
-part of the identity for the two KEV types. Host-level evidence uses port 0 /
-transport 'host'.
-
-ATTRIBUTION (org_id/org_name/sector + attr_method/attr_confidence) is carried
-separately from evidence confidence. When a lead's attributed org_id CHANGES
-between refreshes (both non-empty) or its attribution confidence DROPS, the
-notification episode is closed: event `owner_changed` (old org + notification
-history), status -> new (prior_status kept), notified_on/via/analyst cleared, and
-`needs_attribution_review` set — packets refuse the lead until an analyst runs
-`set <id> --review-cleared`.
+ATTRIBUTION comes from the PUBLISHED registry generation (store/registry/CURRENT via
+registry.Attributor). Three distinct outcomes:
+  * registry UNAVAILABLE (no generation / no rows): every lead keeps its previous
+    org fields untouched; a brand-new lead gets the network-operator label, low
+    confidence, needs_attribution_review — and the run says so;
+  * an explicit row with NO org (e.g. a lone arin_rdap observation) is
+    authoritative: it replaces older store-derived ownership — the lead shows the
+    operator label as org_name, attr_confidence low, needs_attribution_review;
+  * an attributed row: whole-address methods (ots_cidr / registry_network) bind
+    every service on the address. Any other method binds a lead only if the
+    lead's OWN observation carries a hostname / certificate name under one of the
+    org's registry domains (Attributor.lookup_domain) or the org name in cert_org;
+    otherwise the lead keeps the operator label, attr_method 'unbound(<method>)',
+    low confidence, needs_attribution_review. Host-level evidence on a
+    non-ownership attribution is always flagged for review.
+The registry's `conflict` column is carried as attr_conflict; any conflict sets
+needs_attribution_review. Ownership is reconciled for EVERY existing lead each
+refresh (candidates or not, eligible or not); a change of org_id — including
+empty <-> non-empty — or a confidence drop closes the notification episode
+(`owner_changed` event, status new, prior_status, notified/analyst cleared,
+review flag). org_at_first_seen keeps the ownership recorded when the lead was raised.
 
 LIFECYCLE (status): new -> queued -> notified -> acknowledged -> remediated -> new
-(only on a NEWER SCAN: banner_ts, falling back to the collection date only when
-banner_ts is null — a re-collected cached banner never reopens); disputed |
-false_positive | suppressed are analyst decisions. notified/acknowledged ->
-remediated ONLY when the specific service's exposure_status is 'gone' (host-level:
-every service of the host gone). last_seen/last_scan_ts = newest scan supporting
-the lead; last_evaluated = the refresh that last looked at it.
+(only on a NEWER SCAN: banner_ts, collection date only when banner_ts is null);
+disputed | false_positive | suppressed are analyst decisions. notified/acknowledged
+-> remediated ONLY when the specific service's exposure_status is 'gone'
+(host-level: every service of the host gone). Host-level leads carry last_event.
 
-STORAGE: the authoritative state is store/leads/leads.duckdb (tables `leads` —
-lead_id PRIMARY KEY — and `lead_events`), never touched by a store rebuild. Every
-committed change is snapshotted to store/leads/snapshots/<generation>/ (leads +
-events parquet, written BEFORE commit for `set`) and the pointer file
-store/leads/CURRENT is published atomically only AFTER the commit; the newest 5
-snapshots are kept; restore reads the pointer. The `leads` table inside
-store/exposure.duckdb is a re-published COPY. MIGRATION: the first run on a fresh
-leads.duckdb imports a legacy `leads` table from the store transactionally and maps
-old KEV lead ids (no CVE in the hash) onto the new per-CVE leads.
-
-PASSIVE. Every lead is a lead to verify; nothing here touches a host.
+STORAGE: authoritative store/leads/leads.duckdb (leads — lead_id PRIMARY KEY —,
+lead_events, migrations); snapshots in store/leads/snapshots/<generation>/ with a
+CURRENT pointer published only after commit (newest 5 kept); the `leads` table in
+exposure.duckdb is a re-published COPY. Migrations are recorded in the
+`migrations` table: legacy_import_v1 (import a legacy store table, map old KEV ids
+onto per-CVE leads only where the legacy evidence names exactly that CVE, keep and
+flag legacy rows with no target) and shadowserver_class_id_v1 (re-key shadowserver
+leads in place). PASSIVE. Every lead is a lead to verify.
 
 Usage:
     leads.py refresh [--dry-run] [--today YYYY-MM-DD]
     leads.py list [--tier T] [--status S] [--sector X] [--evidence E] [--org NAME] [--ip IP]
                   [--limit N] [--include-ineligible]
-    leads.py set <lead_id> [--status notified] [--via MS-ISAC] [--analyst jd] [--note "..."] [--review-cleared]
+    leads.py set <lead_id> [--status notified] [--via ...] [--analyst ...] [--note ...]
+                  [--review-cleared | --needs-review]
     leads.py digest [--weekly] [--out reports/leads_digest.md]
 """
 import argparse
@@ -80,76 +82,71 @@ import re
 import shutil
 import statistics
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import duckdb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import triage_report as tr    # ICS_PORTS
 import build_store as bs      # APPLIANCE_PATTERNS (shared with the appliance_exposure view), SECTOR_TIER
+import registry as rg         # Attributor: published generation, lookup, lookup_domain
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "store", "exposure.duckdb")
 LEADS_DIR = os.path.join(SCRIPT_DIR, "store", "leads")
+REGISTRY_DIR = os.path.join(SCRIPT_DIR, "store", "registry")
 LEDGER_PATH = os.path.join(SCRIPT_DIR, "compromise_hits", "seen_ledger.json")
 HITS_DIR = os.path.join(SCRIPT_DIR, "compromise_hits")
 IOC_PATH = os.path.join(SCRIPT_DIR, "reference", "ioc_ips.json")
-ATTRIBUTION_PARQUET = os.path.join(SCRIPT_DIR, "store", "registry", "ip_attribution.parquet")
 SS_EVENTS_PARQUET = os.path.join(SCRIPT_DIR, "store", "shadowserver", "events.parquet")
 KEEP_SNAPSHOTS = 5
 
 LEAD_COLUMNS = ["lead_id", "ip", "port", "transport", "org_id", "org_name", "tier", "sector",
                 "evidence_type", "evidence_key", "evidence", "confidence", "severity",
-                "attr_method", "attr_confidence",
+                "attr_method", "attr_confidence", "attr_conflict", "org_at_first_seen",
                 "eligible", "eligibility_reason", "prior_status", "needs_attribution_review",
-                "first_seen", "last_seen", "last_scan_ts", "last_evaluated", "status",
+                "first_seen", "last_seen", "last_scan_ts", "last_event", "last_evaluated", "status",
                 "notified_via", "notified_on", "analyst", "notes", "updated_at"]
 LEAD_TYPES = {"port": "INTEGER", "first_seen": "DATE", "last_seen": "DATE", "last_evaluated": "DATE",
-              "notified_on": "DATE", "updated_at": "TIMESTAMP", "last_scan_ts": "TIMESTAMP",
+              "last_event": "DATE", "notified_on": "DATE", "updated_at": "TIMESTAMP", "last_scan_ts": "TIMESTAMP",
               "eligible": "BOOLEAN DEFAULT TRUE", "needs_attribution_review": "BOOLEAN DEFAULT FALSE"}
 LEADS_DDL = "CREATE TABLE IF NOT EXISTS leads (" + ", ".join(
-    f"{c} {LEAD_TYPES.get(c, 'VARCHAR')}" + (" PRIMARY KEY" if c == "lead_id" else "")
-    for c in LEAD_COLUMNS) + ")"
-EVENTS_DDL = ("CREATE TABLE IF NOT EXISTS lead_events (ts TIMESTAMP, lead_id VARCHAR, "
-              "event VARCHAR, detail VARCHAR)")
+    f"{c} {LEAD_TYPES.get(c, 'VARCHAR')}" + (" PRIMARY KEY" if c == "lead_id" else "") for c in LEAD_COLUMNS) + ")"
+EVENTS_DDL = "CREATE TABLE IF NOT EXISTS lead_events (ts TIMESTAMP, lead_id VARCHAR, event VARCHAR, detail VARCHAR)"
+MIGRATIONS_DDL = "CREATE TABLE IF NOT EXISTS migrations (name VARCHAR PRIMARY KEY, applied_at TIMESTAMP, detail VARCHAR)"
 
-STATUSES = ["new", "queued", "notified", "acknowledged", "remediated", "disputed",
-            "false_positive", "suppressed"]
+STATUSES = ["new", "queued", "notified", "acknowledged", "remediated", "disputed", "false_positive", "suppressed"]
 ANALYST_STATUSES = {"queued", "notified", "acknowledged", "disputed", "false_positive", "suppressed"}
-MIGRATE_STATUSES = {"suppressed", "false_positive", "notified", "acknowledged"}
-EVIDENCE_TYPES = ["kev_verified", "kev_inferred", "appliance", "ics", "compromise_tag",
-                  "shadowserver", "ioc_match", "cred_leak"]
+EVIDENCE_TYPES = ["kev_verified", "kev_inferred", "appliance", "ics", "compromise_tag", "shadowserver", "ioc_match", "cred_leak"]
 CVE_TYPES = {"kev_verified", "kev_inferred"}
-EVIDENCE_RANK = {"kev_verified": 0, "compromise_tag": 1, "shadowserver": 2, "ics": 3,
-                 "appliance": 4, "kev_inferred": 5, "ioc_match": 6, "cred_leak": 7}
+EVIDENCE_RANK = {"kev_verified": 0, "compromise_tag": 1, "shadowserver": 2, "ics": 3, "appliance": 4,
+                 "kev_inferred": 5, "ioc_match": 6, "cred_leak": 7}
 SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-TIER_RANK = {"critical_infrastructure": 0, "government": 1, "education": 2,
-             "small_business": 3, "unclassified": 4, "out_of_state_gov": 5}
+TIER_RANK = {"critical_infrastructure": 0, "government": 1, "education": 2, "small_business": 3,
+             "unclassified": 4, "out_of_state_gov": 5}
 ATTR_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
 WHOLE_ADDRESS_METHODS = {"ots_cidr", "registry_network"}
 PRIORITY_TIERS = {"government", "education", "critical_infrastructure"}
 NEVER_LEAD_TIERS = {"residential", "honeypot"}
 TIER_TO_SECTOR = {"critical_infrastructure": "critical_infrastructure", "government": "government",
-                  "education": "education", "small_business": "small_business",
-                  "out_of_state_gov": "out_of_state", "residential": "other",
-                  "unclassified": "other", "honeypot": "other"}
+                  "education": "education", "small_business": "small_business", "out_of_state_gov": "out_of_state",
+                  "residential": "other", "unclassified": "other", "honeypot": "other"}
 SECTOR_TIER = getattr(bs, "SECTOR_TIER", {"critical_infrastructure": "critical_infrastructure",
-                                          "healthcare": "critical_infrastructure",
-                                          "energy": "critical_infrastructure", "water": "critical_infrastructure",
-                                          "government": "government", "education": "education",
-                                          "small_business": "small_business", "out_of_state": "out_of_state_gov"})
+                                          "healthcare": "critical_infrastructure", "energy": "critical_infrastructure",
+                                          "water": "critical_infrastructure", "government": "government",
+                                          "education": "education", "small_business": "small_business",
+                                          "out_of_state": "out_of_state_gov"})
 UNATTRIBUTED = "unattributed"
 TRANSPORTS = {"tcp", "udp", "icmp", "other", "host"}
-
 COMPROMISE_WINDOW_DAYS = 30
 SHADOWSERVER_WINDOW_DAYS = 14
+HOST_EVENT_FRESH_DAYS = 30
 HOST_PORT, HOST_TRANSPORT = 0, "host"
 
-ICS_MODULES = {"modbus", "s7", "siemens_s7", "dnp3", "bacnet", "ethernetip", "fox", "iec-104",
-               "iec104", "codesys", "omron", "pcworx", "proconos", "ge-srtp", "hart-ip", "melsec",
-               "redlion-crimson3", "crestron", "unitronics-pcom", "automated-tank-gauge",
-               "vertx-edge", "lantronix-udp", "moxa-nport", "niagara-fox", "bacnet-ip", "iec-61850",
-               "mms", "opc-ua", "opcua", "profinet", "cspv4", "fins", "koyo", "kamstrup"}
+ICS_MODULES = {"modbus", "s7", "siemens_s7", "dnp3", "bacnet", "ethernetip", "fox", "iec-104", "iec104", "codesys",
+               "omron", "pcworx", "proconos", "ge-srtp", "hart-ip", "melsec", "redlion-crimson3", "crestron",
+               "unitronics-pcom", "automated-tank-gauge", "vertx-edge", "lantronix-udp", "moxa-nport", "niagara-fox",
+               "bacnet-ip", "iec-61850", "mms", "opc-ua", "opcua", "profinet", "cspv4", "fins", "koyo", "kamstrup"}
 APPLIANCE_PATTERNS = bs.APPLIANCE_PATTERNS
 _APPLIANCE_RX = [(label, re.compile(rx)) for label, rx in APPLIANCE_PATTERNS]
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}")
@@ -159,10 +156,22 @@ def log(msg):
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} - {msg}", flush=True)
 
 
+def canon_ip(s):
+    """Canonical spelling (IPv6 compressed) so keys match the store; non-addresses pass through."""
+    try:
+        return ipaddress.ip_address(str(s).strip()).compressed
+    except ValueError:
+        return str(s).strip()
+
+
 def lead_id(ip, port, transport, evidence_type, key=""):
-    base = f"{ip}|{port}|{transport}|{evidence_type}"
+    """sha1(ip|port|transport|evidence_type[|cve | class])[:16]: the CVE for the KEV
+    types, the report class (compromise|exposure) for shadowserver."""
+    base = f"{canon_ip(ip)}|{port}|{transport}|{evidence_type}"
     if evidence_type in CVE_TYPES and key:
         base += f"|{key}"
+    elif evidence_type == "shadowserver" and key:
+        base += f"|{str(key).split(':')[0]}"
     return hashlib.sha1(base.encode()).hexdigest()[:16]
 
 
@@ -178,7 +187,6 @@ def _parse_date(s):
 
 
 def _parse_ts(s):
-    """A scan timestamp: datetime, ISO string, or a date (-> midnight)."""
     if isinstance(s, datetime):
         return s.replace(tzinfo=None)
     if isinstance(s, date):
@@ -189,7 +197,6 @@ def _parse_ts(s):
     try:
         dt = datetime.fromisoformat(t.replace(" ", "T", 1) if " " in t and "T" not in t else t)
         if dt.tzinfo is not None:
-            from datetime import timezone
             dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
         return dt
     except ValueError:
@@ -202,16 +209,15 @@ def norm_transport(t):
     return t if t in TRANSPORTS else ("other" if t else "tcp")
 
 
-# --- connections / storage -------------------------------------------------------
+def is_host_level(evidence_type, transport, evidence_key=None):
+    return transport == HOST_TRANSPORT
+
+
+# --- connections / storage ---------------------------------------------------------
 
 class Ctx:
-    def __init__(self, con, store_path, leads_dir, store_writable, fresh):
-        self.con, self.store_path, self.leads_dir = con, store_path, leads_dir
-        self.store_writable, self.fresh = store_writable, fresh
-
-    @property
-    def db_path(self):
-        return os.path.join(self.leads_dir, "leads.duckdb")
+    def __init__(self, con, store_path, leads_dir, store_writable):
+        self.con, self.store_path, self.leads_dir, self.store_writable = con, store_path, leads_dir, store_writable
 
     def close(self):
         try:
@@ -224,8 +230,7 @@ def open_ctx(store_path=DB_PATH, leads_dir=LEADS_DIR, write=False):
     if not os.path.exists(store_path):
         raise SystemExit(f"ERROR: store {store_path} does not exist — run build_store.py first")
     db = os.path.join(leads_dir, "leads.duckdb")
-    fresh = not os.path.exists(db)
-    if fresh and not write:
+    if not os.path.exists(db) and not write:
         raise SystemExit("no leads yet — run `leads.py refresh`")
     os.makedirs(leads_dir, exist_ok=True)
     try:
@@ -244,9 +249,9 @@ def open_ctx(store_path=DB_PATH, leads_dir=LEADS_DIR, write=False):
             con.execute(f"ATTACH '{store_path}' AS store (READ_ONLY)")
         except duckdb.Error as exc:
             con.close()
-            raise SystemExit(f"ERROR: cannot open the store {store_path} ({exc}). If a store rebuild "
-                             f"is running, wait for it and re-run.")
-    return Ctx(con, store_path, leads_dir, writable, fresh)
+            raise SystemExit(f"ERROR: cannot open the store {store_path} ({exc}). If a store rebuild is running, "
+                             f"wait for it and re-run.")
+    return Ctx(con, store_path, leads_dir, writable)
 
 
 def table_exists(con, name, catalog=None):
@@ -272,7 +277,6 @@ def fetch_dicts(con, sql, params=None):
 
 
 def current_snapshot(leads_dir):
-    """Snapshot directory the CURRENT pointer names, or None."""
     try:
         with open(os.path.join(leads_dir, "CURRENT")) as fh:
             gen = fh.read().strip()
@@ -283,13 +287,12 @@ def current_snapshot(leads_dir):
 
 
 def write_snapshot(ctx):
-    """Write BOTH mirrors into a NEW generation directory (nothing existing is
-    replaced). Returns the generation name; publish_pointer makes it current."""
     gen = f"{datetime.now():%Y%m%dT%H%M%S%f}-{os.getpid()}"
     d = os.path.join(ctx.leads_dir, "snapshots", gen)
     os.makedirs(d, exist_ok=True)
     for name, sql in (("leads.parquet", "SELECT * FROM leads ORDER BY lead_id"),
-                      ("lead_events.parquet", "SELECT * FROM lead_events ORDER BY ts, lead_id")):
+                      ("lead_events.parquet", "SELECT * FROM lead_events ORDER BY ts, lead_id"),
+                      ("migrations.parquet", "SELECT * FROM migrations ORDER BY name")):
         tmp = os.path.join(d, f"{name}.tmp-{os.getpid()}")
         ctx.con.execute(f"COPY ({sql}) TO '{tmp}' (FORMAT PARQUET)")
         os.replace(tmp, os.path.join(d, name))
@@ -301,7 +304,6 @@ def discard_snapshot(ctx, gen):
 
 
 def publish_pointer(ctx, gen, keep=KEEP_SNAPSHOTS):
-    """Atomically point CURRENT at `gen` (after the DB commit), then prune."""
     ptr = os.path.join(ctx.leads_dir, "CURRENT")
     tmp = f"{ptr}.tmp-{os.getpid()}"
     with open(tmp, "w") as fh:
@@ -309,14 +311,13 @@ def publish_pointer(ctx, gen, keep=KEEP_SNAPSHOTS):
     os.replace(tmp, ptr)
     root = os.path.join(ctx.leads_dir, "snapshots")
     gens = sorted(g for g in os.listdir(root) if os.path.isdir(os.path.join(root, g)))
-    for old in [g for g in gens if g != gen][:-(keep - 1) or None] if len(gens) > keep else []:
-        shutil.rmtree(os.path.join(root, old), ignore_errors=True)
+    if len(gens) > keep:
+        for old in [g for g in gens if g != gen][:len(gens) - keep]:
+            shutil.rmtree(os.path.join(root, old), ignore_errors=True)
 
 
 def ensure_leads_db(ctx):
-    """Create/upgrade the authoritative tables; restore from the CURRENT snapshot
-    (or the legacy flat leads.parquet) when `leads` is empty.
-    Returns 'existing' | 'restored' | 'created'."""
+    """Create/upgrade the authoritative tables; restore from the CURRENT snapshot when empty."""
     con = ctx.con
     cat = con.execute("SELECT current_database()").fetchone()[0]
     existed = table_exists(con, "leads", cat)
@@ -327,20 +328,22 @@ def ensure_leads_db(ctx):
         for c in LEAD_COLUMNS:
             if c not in have:
                 con.execute(f"ALTER TABLE leads ADD COLUMN {c} {LEAD_TYPES.get(c, 'VARCHAR')}")
-    if not table_exists(con, "lead_events", cat):
-        con.execute(EVENTS_DDL)
+    for ddl, name in ((EVENTS_DDL, "lead_events"), (MIGRATIONS_DDL, "migrations")):
+        if not table_exists(con, name, cat):
+            con.execute(ddl)
     if con.execute("SELECT count(*) FROM leads").fetchone()[0] == 0:
         snap = current_snapshot(ctx.leads_dir)
-        lp = os.path.join(snap, "leads.parquet") if snap else os.path.join(ctx.leads_dir, "leads.parquet")
-        ep = os.path.join(snap, "lead_events.parquet") if snap else os.path.join(ctx.leads_dir, "lead_events.parquet")
-        if os.path.exists(lp):
+        if snap and os.path.exists(os.path.join(snap, "leads.parquet")):
+            lp = os.path.join(snap, "leads.parquet")
             cols_in = [r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{lp}')").fetchall()]
             sel = ", ".join(c if c in cols_in else
-                            ("TRUE" if c == "eligible" else "FALSE" if c == "needs_attribution_review" else "NULL")
-                            + f" AS {c}" for c in LEAD_COLUMNS)
+                            ("TRUE" if c == "eligible" else "FALSE" if c == "needs_attribution_review" else "NULL") + f" AS {c}"
+                            for c in LEAD_COLUMNS)
             con.execute(f"INSERT INTO leads SELECT {sel} FROM read_parquet('{lp}')")
-            if os.path.exists(ep):
-                con.execute(f"INSERT INTO lead_events SELECT * FROM read_parquet('{ep}')")
+            for name, tbl in (("lead_events.parquet", "lead_events"), ("migrations.parquet", "migrations")):
+                p = os.path.join(snap, name)
+                if os.path.exists(p):
+                    con.execute(f"INSERT INTO {tbl} SELECT * FROM read_parquet('{p}')")
             return "restored"
     return "existing" if existed else "created"
 
@@ -358,9 +361,6 @@ def publish_copy(ctx):
 
 
 def commit_with_snapshot(ctx, ops, snapshot_before_commit=False):
-    """Apply ops in one transaction; snapshot; publish the pointer only after the
-    commit succeeded. With snapshot_before_commit (used by `set`) the snapshot is
-    written inside the transaction so a failed mirror rolls the change back."""
     con = ctx.con
     con.begin()
     gen = None
@@ -382,56 +382,150 @@ def commit_with_snapshot(ctx, ops, snapshot_before_commit=False):
     return gen
 
 
-# --- store reads --------------------------------------------------------------------
+def migration_applied(con, name):
+    return con.execute("SELECT count(*) FROM migrations WHERE name = ?", [name]).fetchone()[0] > 0
+
+
+# --- store reads -------------------------------------------------------------------
 
 def _adaptive_cols(con, view, wanted, catalog="store"):
     have = set(columns_of(con, view, catalog))
     return ", ".join(c if c in have else f"NULL AS {c}" for c in wanted)
 
 
-CS_COLS = ["date", "ip", "port", "transport", "org", "product", "version", "cpe23", "service", "info",
-           "city", "hostnames", "tags", "banner_ts", "tier", "tier_reason", "observation_id",
-           "http_title", "http_server", "cert_cn", "cert_org"]
+CS_COLS = ["date", "ip", "port", "transport", "org", "product", "version", "cpe23", "service", "info", "city",
+           "hostnames", "tags", "banner_ts", "tier", "tier_reason", "observation_id", "http_title", "http_server",
+           "cert_cn", "cert_org", "cert_sans"]
+SVC_COLS = ["ip", "port", "transport", "org", "hostnames", "cert_cn", "cert_org", "cert_sans", "banner_ts", "date"]
 
 
 def select_current_state(con):
-    return fetch_dicts(con, f"SELECT {_adaptive_cols(con, 'current_state', CS_COLS)} FROM store.current_state")
+    rows = fetch_dicts(con, f"SELECT {_adaptive_cols(con, 'current_state', CS_COLS)} FROM store.current_state")
+    for r in rows:
+        r["ip"] = canon_ip(r["ip"])
+    return rows
 
 
 def host_tiers(con):
     extra = _adaptive_cols(con, "latest_observed", ["attr_org_id", "attr_org_name", "attr_method", "attr_confidence"])
     rows = fetch_dicts(con, f"""
         SELECT ip, tier, org, date AS newest, banner_ts, {extra} FROM (
-          SELECT *, row_number() OVER (PARTITION BY ip ORDER BY date DESC, banner_ts DESC NULLS LAST,
-                                       observation_id DESC) AS rn
+          SELECT *, row_number() OVER (PARTITION BY ip ORDER BY date DESC, banner_ts DESC NULLS LAST, observation_id DESC) AS rn
           FROM store.latest_observed) WHERE rn = 1""")
-    return {r["ip"]: r for r in rows}
+    return {canon_ip(r["ip"]): r for r in rows}
+
+
+def service_rows(con, ips):
+    """(ip, port, transport) -> latest observation identity fields, for the ips given."""
+    if not ips:
+        return {}
+    ph = ", ".join("?" * len(ips))
+    rows = fetch_dicts(con, f"SELECT {_adaptive_cols(con, 'latest_observed', SVC_COLS)} FROM store.latest_observed "
+                            f"WHERE ip IN ({ph})", sorted(ips))
+    return {(canon_ip(r["ip"]), r["port"], norm_transport(r["transport"])): r for r in rows}
 
 
 def kev_by_service(con):
     rows = fetch_dicts(con, """
         SELECT cs.ip, cs.port, cs.transport, v.verified, v.cve, v.epss, v.cvss
-        FROM store.current_state cs
-        JOIN store.vulns v ON v.observation_id = cs.observation_id AND v.date = cs.date
+        FROM store.current_state cs JOIN store.vulns v ON v.observation_id = cs.observation_id AND v.date = cs.date
         WHERE v.in_kev""")
     out = {}
     for r in rows:
-        out.setdefault((r["ip"], r["port"], r["transport"], bool(r["verified"])), []).append(r)
+        out.setdefault((canon_ip(r["ip"]), r["port"], norm_transport(r["transport"]), bool(r["verified"])), []).append(r)
     return out
 
 
-def load_attribution(con, parquet=ATTRIBUTION_PARQUET):
-    if not parquet or not os.path.exists(parquet):
-        return {}
-    try:
-        rows = fetch_dicts(con, f"SELECT * FROM read_parquet('{parquet}')")
-    except duckdb.Error as exc:
-        log(f"WARNING: registry attribution unreadable ({exc})")
-        return {}
-    return {r["ip"]: r for r in rows if r.get("ip")}
+# --- registry attribution ----------------------------------------------------------
+
+class Registry:
+    """The published registry generation, or an explicit UNAVAILABLE state."""
+
+    def __init__(self, store_dir=REGISTRY_DIR):
+        self.att, self.available, self.generation = None, False, None
+        try:
+            self.att = rg.Attributor().load(store_dir)
+            self.generation = self.att.generation
+            self.available = bool(self.att.attribution) or len(self.att.networks) > 0
+        except Exception as exc:          # registry code/data broken: never take the run down
+            log(f"WARNING: registry could not be loaded ({exc}) — attribution UNAVAILABLE this run")
+        if not self.available:
+            log(f"registry attribution UNAVAILABLE (generation {self.generation or 'none'}): existing org fields are "
+                f"kept untouched; new leads carry the network-operator label and need review")
+
+    def lookup(self, ip):
+        return self.att.lookup(ip) if self.available else None
+
+    def lookup_domain(self, name):
+        return self.att.lookup_domain(name) if self.available else None
+
+    def org_name(self, org_id):
+        o = self.att.orgs.get(org_id) if (self.available and org_id) else None
+        return (o or {}).get("name") or None
 
 
-# --- evidence rules -------------------------------------------------------------------
+def _names_of(row):
+    names = [n.strip() for n in str(row.get("hostnames") or "").split(",") if n.strip()]
+    for k in ("cert_cn", "cert_sans"):
+        names += [n.strip() for n in str(row.get(k) or "").split(",") if n.strip()]
+    return names
+
+
+def service_bound(reg, org_id, org_name, obs):
+    """Does this lead's OWN observation name the org (registry domain of a hostname
+    / cert name, or the org name in cert_org)?"""
+    if not obs:
+        return False
+    for n in _names_of(obs):
+        hit = reg.lookup_domain(n)
+        if hit and (hit.get("org_id") or "") == (org_id or ""):
+            return True
+    co = str(obs.get("cert_org") or "").strip().lower()
+    return bool(co) and bool(org_name) and co == org_name.strip().lower()
+
+
+def resolve_attribution(reg, ip, hi, obs, host_level, prev=None):
+    """Attribution for ONE lead. Returns dict(org_id, org_name, sector, attr_method,
+    attr_confidence, attr_conflict, review, reason)."""
+    label = ((hi or {}).get("org") or "").strip() or None          # Shodan org = network-operator label
+    out = {"org_id": None, "org_name": label or UNATTRIBUTED, "sector": None, "attr_method": "shodan_org" if label else None,
+           "attr_confidence": "low" if label else "none", "attr_conflict": "", "review": bool(label), "reason": "operator label"}
+    if not reg.available:
+        if prev is not None:
+            return dict(prev, reason="registry unavailable — previous attribution kept")
+        return dict(out, reason="registry unavailable")
+    row = reg.lookup(ip)
+    if row is None:
+        # unknown to the registry: the store's own attr_* columns, else the label
+        if hi and (hi.get("attr_org_id") or hi.get("attr_org_name")):
+            row = {"org_id": hi.get("attr_org_id") or "", "org_name": hi.get("attr_org_name") or "",
+                   "sector": "", "method": hi.get("attr_method") or "store", "confidence": hi.get("attr_confidence") or "low",
+                   "conflict": ""}
+        else:
+            return dict(out, reason="ip unknown to the registry")
+    org_id = (row.get("org_id") or "").strip() or None
+    org_name = (row.get("org_name") or "").strip() or (reg.org_name(org_id) if org_id else None)
+    method, conf = row.get("method") or "unknown", row.get("confidence") or "low"
+    conflict = str(row.get("conflict") or "").strip()
+    if not org_id and not org_name:
+        return dict(out, attr_method=method, attr_confidence="low", attr_conflict=conflict,
+                    review=bool(label) or bool(conflict), reason="explicit registry row without an organisation")
+    sector = (row.get("sector") or "").strip() or None
+    if method in WHOLE_ADDRESS_METHODS:
+        return {"org_id": org_id, "org_name": org_name, "sector": sector, "attr_method": method, "attr_confidence": conf,
+                "attr_conflict": conflict, "review": bool(conflict), "reason": "whole-address ownership"}
+    if host_level:
+        return {"org_id": org_id, "org_name": org_name, "sector": sector, "attr_method": method, "attr_confidence": conf,
+                "attr_conflict": conflict, "review": True, "reason": "host-level evidence on a non-ownership attribution"}
+    if service_bound(reg, org_id, org_name, obs):
+        return {"org_id": org_id, "org_name": org_name, "sector": sector, "attr_method": method, "attr_confidence": conf,
+                "attr_conflict": conflict, "review": bool(conflict), "reason": "service names the org"}
+    return {"org_id": None, "org_name": label or org_name, "sector": sector, "attr_method": f"unbound({method})",
+            "attr_confidence": "low", "attr_conflict": conflict, "review": True,
+            "reason": f"service does not name {org_name}: label kept"}
+
+
+# --- evidence rules ------------------------------------------------------------------
 
 def appliance_match(row):
     text = " ".join(str(row.get(k) or "") for k in ("product", "cpe23", "http_title")).lower()
@@ -466,8 +560,8 @@ def service_desc(row):
 def load_ledger(path):
     try:
         with open(path) as fh:
-            return json.load(fh).get("hosts", {})
-    except (OSError, ValueError):
+            return {canon_ip(k): v for k, v in json.load(fh).get("hosts", {}).items()}
+    except (OSError, ValueError, AttributeError):
         return {}
 
 
@@ -488,46 +582,13 @@ def load_hit_ports(hits_dir, since):
                     if not ip or port is None:
                         continue
                     key = (int(port), norm_transport(b.get("transport")))
-                    e = out.setdefault(ip, {}).setdefault(key, {"tags": set(), "selectors": set(), "banner_ts": ""})
+                    e = out.setdefault(canon_ip(ip), {}).setdefault(key, {"tags": set(), "selectors": set(), "banner_ts": ""})
                     e["tags"].update(b.get("tags") or [])
                     if b.get("_compromise_selector"):
                         e["selectors"].add(b["_compromise_selector"])
                     e["banner_ts"] = max(e["banner_ts"], b.get("timestamp") or "")
         except OSError:
             continue
-    return out
-
-
-def ioc_hits(con, ioc_path):
-    """ip -> {sources, cidrs, services, scan_ts} from the store's ioc_matches VIEW
-    (exact ip AND CIDR-range hits). Fallback: the JSON's ip keys (never the
-    `_cidrs` / `_meta` keys) against current_state."""
-    out = {}
-    if table_exists(con, "ioc_matches", "store"):
-        cols = _adaptive_cols(con, "ioc_matches", ["ip", "port", "transport", "ioc_sources", "ioc_cidr", "banner_ts", "date"])
-        rows = fetch_dicts(con, f"SELECT {cols} FROM store.ioc_matches")
-    else:
-        rows = []
-        try:
-            with open(ioc_path) as fh:
-                d = json.load(fh)
-        except (OSError, ValueError):
-            d = {}
-        keys = {k for k in d if not str(k).startswith("_") and _is_ip(k)}
-        if keys:
-            for r in select_current_state(con):
-                if r["ip"] in keys:
-                    v = d[r["ip"]]
-                    rows.append(dict(r, ioc_sources=",".join(v) if isinstance(v, list) else str(v), ioc_cidr=None))
-    for r in rows:
-        e = out.setdefault(r["ip"], {"sources": set(), "cidrs": set(), "services": set(), "scan_ts": None})
-        e["sources"].update(s.strip() for s in str(r.get("ioc_sources") or "").split(",") if s.strip())
-        if r.get("ioc_cidr"):
-            e["cidrs"].add(r["ioc_cidr"])
-        e["services"].add(f"{r.get('port')}/{norm_transport(r.get('transport'))}")
-        ts = _parse_ts(r.get("banner_ts")) or _parse_ts(r.get("date"))
-        if ts and (e["scan_ts"] is None or ts > e["scan_ts"]):
-            e["scan_ts"] = ts
     return out
 
 
@@ -539,17 +600,46 @@ def _is_ip(s):
         return False
 
 
+def ioc_hits(con, ioc_path):
+    out = {}
+    if table_exists(con, "ioc_matches", "store"):
+        cols = _adaptive_cols(con, "ioc_matches", ["ip", "port", "transport", "ioc_sources", "ioc_cidr", "banner_ts", "date"])
+        rows = fetch_dicts(con, f"SELECT {cols} FROM store.ioc_matches")
+    else:
+        rows = []
+        try:
+            with open(ioc_path) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            d = {}
+        keys = {canon_ip(k) for k in d if not str(k).startswith("_") and _is_ip(k)}
+        if keys:
+            for r in select_current_state(con):
+                if r["ip"] in keys:
+                    v = d.get(r["ip"]) or next((v for k, v in d.items() if canon_ip(k) == r["ip"]), [])
+                    rows.append(dict(r, ioc_sources=",".join(v) if isinstance(v, list) else str(v), ioc_cidr=None))
+    for r in rows:
+        ip = canon_ip(r["ip"])
+        e = out.setdefault(ip, {"sources": set(), "cidrs": set(), "services": set(), "scan_ts": None})
+        e["sources"].update(s.strip() for s in str(r.get("ioc_sources") or "").split(",") if s.strip())
+        if r.get("ioc_cidr"):
+            e["cidrs"].add(r["ioc_cidr"])
+        e["services"].add(f"{r.get('port')}/{norm_transport(r.get('transport'))}")
+        ts = _parse_ts(r.get("banner_ts")) or _parse_ts(r.get("date"))
+        if ts and (e["scan_ts"] is None or ts > e["scan_ts"]):
+            e["scan_ts"] = ts
+    return out
+
+
 def shadowserver_recent(con, today, parquet=SS_EVENTS_PARQUET):
-    """Recent events from the AUTHORITATIVE parquet (the store table is a copy that
-    a rebuild wipes and a failed publish leaves stale)."""
     if not parquet or not os.path.exists(parquet):
         return {}
     since = today - timedelta(days=SHADOWSERVER_WINDOW_DAYS)
-    rows = fetch_dicts(con, f"SELECT report_type, timestamp, ip, port, protocol, tag, severity "
-                            f"FROM read_parquet('{parquet}') WHERE CAST(timestamp AS DATE) >= ?", [since])
+    rows = fetch_dicts(con, f"SELECT report_type, timestamp, ip, port, protocol, tag, severity FROM read_parquet('{parquet}') "
+                            f"WHERE CAST(timestamp AS DATE) >= ?", [since])
     out = {}
     for r in rows:
-        out.setdefault(r["ip"], []).append(r)
+        out.setdefault(canon_ip(r["ip"]), []).append(r)
     return out
 
 
@@ -564,11 +654,11 @@ def sector_to_tier(sector):
     return "unclassified"
 
 
-def generate_candidates(ctx, today, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, ioc_path=IOC_PATH,
-                        attribution_parquet=ATTRIBUTION_PARQUET, ss_parquet=SS_EVENTS_PARQUET):
-    """Returns (candidates {lead_id: dict}, excluded {reason: n}, host(ip) -> info)."""
+def generate_candidates(ctx, today, reg, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, ioc_path=IOC_PATH,
+                        ss_parquet=SS_EVENTS_PARQUET):
+    """Evidence only (attribution is resolved per lead in refresh).
+    Returns (candidates {lead_id: dict}, excluded, host(ip) -> info, hosts)."""
     con = ctx.con
-    registry = load_attribution(con, attribution_parquet)
     hosts = host_tiers(con)
     cs_rows = select_current_state(con)
     kev = kev_by_service(con)
@@ -578,31 +668,20 @@ def generate_candidates(ctx, today, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, 
     def host(ip):
         if ip in host_info:
             return host_info[ip]
-        h, reg = hosts.get(ip), registry.get(ip)
+        h = hosts.get(ip)
+        row = reg.lookup(ip)
         if h:
             tier, basis = h["tier"] or "unclassified", "newest observation"
-        elif reg and (reg.get("sector") or "").strip():
-            tier, basis = sector_to_tier(reg.get("sector")), "registry sector"
+        elif row and (row.get("sector") or "").strip():
+            tier, basis = sector_to_tier(row.get("sector")), "registry sector"
         else:
             tier, basis = "unclassified", "unknown host"
-        org_id = org_name = sector = method = None
-        conf = "none"
-        if reg and ((reg.get("org_name") or "").strip() or (reg.get("org_id") or "").strip()):
-            org_id = (reg.get("org_id") or "").strip() or None
-            org_name = (reg.get("org_name") or "").strip() or None
-            sector, method, conf = reg.get("sector") or None, reg.get("method"), reg.get("confidence") or "low"
-        elif h and (h.get("attr_org_name") or h.get("attr_org_id")):
-            org_id, org_name = h.get("attr_org_id") or None, h.get("attr_org_name") or None
-            method, conf = h.get("attr_method") or "store", h.get("attr_confidence") or "low"
-        elif h and (h.get("org") or "").strip():
-            org_name, method, conf = h["org"].strip(), "shodan_org", "low"
-        if not org_name:
-            org_name = org_id or UNATTRIBUTED
-        eligible = tier not in NEVER_LEAD_TIERS
-        info = {"tier": tier, "known": bool(h or reg), "in_store": bool(h), "org_id": org_id, "org_name": org_name,
-                "sector": sector or TIER_TO_SECTOR.get(tier, "other"), "attr_method": method,
-                "attr_confidence": conf, "eligible": eligible,
-                "eligibility_reason": f"host tier {tier} ({basis})" if h or reg else "host unknown to store and registry",
+        known = bool(h or row)
+        info = {"tier": tier, "known": known, "in_store": bool(h), "org": (h or {}).get("org"),
+                "attr_org_id": (h or {}).get("attr_org_id"), "attr_org_name": (h or {}).get("attr_org_name"),
+                "attr_method": (h or {}).get("attr_method"), "attr_confidence": (h or {}).get("attr_confidence"),
+                "eligible": tier not in NEVER_LEAD_TIERS,
+                "eligibility_reason": f"host tier {tier} ({basis})" if known else "host unknown to store and registry",
                 "newest": h["newest"] if h else None}
         host_info[ip] = info
         return info
@@ -613,16 +692,16 @@ def generate_candidates(ctx, today, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, 
             excluded[hi["tier"]] = excluded.get(hi["tier"], 0) + 1
         return hi["eligible"]
 
-    def add(ip, port, transport, etype, conf, evidence, key="", severity=None, scan_ts=None):
+    def add(ip, port, transport, etype, conf, evidence, key="", severity=None, scan_ts=None, obs=None, event=None):
         hi = host(ip)
         lid = lead_id(ip, port, transport, etype, key)
         ts = _parse_ts(scan_ts)
         cands[lid] = {"lead_id": lid, "ip": ip, "port": int(port), "transport": norm_transport(transport),
-                      "org_id": hi["org_id"], "org_name": hi["org_name"], "tier": hi["tier"], "sector": hi["sector"],
+                      "tier": hi["tier"], "sector_default": TIER_TO_SECTOR.get(hi["tier"], "other"),
                       "evidence_type": etype, "evidence_key": key or None, "evidence": evidence, "confidence": conf,
-                      "severity": severity, "attr_method": hi["attr_method"], "attr_confidence": hi["attr_confidence"],
-                      "eligible": hi["eligible"], "eligibility_reason": hi["eligibility_reason"],
-                      "scan_ts": ts, "obs_date": ts.date() if ts else None}
+                      "severity": severity, "eligible": hi["eligible"], "eligibility_reason": hi["eligibility_reason"],
+                      "scan_ts": ts, "obs_date": ts.date() if ts else None, "obs": obs,
+                      "last_event": _parse_date(event), "host_level": norm_transport(transport) == HOST_TRANSPORT}
 
     for row in cs_rows:
         ip, port, tp = row["ip"], row["port"], norm_transport(row["transport"])
@@ -630,30 +709,29 @@ def generate_candidates(ctx, today, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, 
             continue
         tier = host(ip)["tier"]
         desc = service_desc(row)
-        scan = row.get("banner_ts") or row["date"]          # banner_ts = the SCAN time; date only as fallback
+        scan = row.get("banner_ts") or row["date"]
         age = f"; banner {str(row['banner_ts'])[:19]}" if row.get("banner_ts") else f"; collected {row['date']}"
         for v in kev.get((ip, port, tp, True), []):
             add(ip, port, tp, "kev_verified", "high",
-                f"{v['cve']} (CISA KEV) VERIFIED by Shodan on {desc}; EPSS {_fmt_epss(v['epss'])}, "
-                f"CVSS {v['cvss'] or 'n/a'}{age}", key=v["cve"], severity="high", scan_ts=scan)
+                f"{v['cve']} (CISA KEV) VERIFIED by Shodan on {desc}; EPSS {_fmt_epss(v['epss'])}, CVSS {v['cvss'] or 'n/a'}{age}",
+                key=v["cve"], severity="high", scan_ts=scan, obs=row)
         for v in kev.get((ip, port, tp, False), []):
             if tier in PRIORITY_TIERS:
                 add(ip, port, tp, "kev_inferred", "medium",
-                    f"{v['cve']} (CISA KEV) inferred from banner version of {desc} (NOT verified); "
-                    f"EPSS {_fmt_epss(v['epss'])}, CVSS {v['cvss'] or 'n/a'}{age}",
-                    key=v["cve"], severity="medium", scan_ts=scan)
+                    f"{v['cve']} (CISA KEV) inferred from banner version of {desc} (NOT verified); EPSS "
+                    f"{_fmt_epss(v['epss'])}, CVSS {v['cvss'] or 'n/a'}{age}", key=v["cve"], severity="medium", scan_ts=scan, obs=row)
             else:
                 excluded["kev_inferred_non_priority"] += 1
         ics = ics_match(row)
         if ics:
-            add(ip, port, tp, "ics", "medium", f"{ics}; service {desc}{age}", key="ics", severity="medium", scan_ts=scan)
+            add(ip, port, tp, "ics", "medium", f"{ics}; service {desc}{age}", key="ics", severity="medium", scan_ts=scan, obs=row)
         app = appliance_match(row)
         if app:
             if tier in PRIORITY_TIERS:
                 add(ip, port, tp, "appliance", "medium",
                     f"Internet-edge appliance {app[0]}: {desc}"
                     f"{'; title ' + repr(str(row['http_title'])[:60]) if row.get('http_title') else ''}{age}",
-                    key=app[0], severity="medium", scan_ts=scan)
+                    key=app[0], severity="medium", scan_ts=scan, obs=row)
             else:
                 excluded["appliance_non_priority"] += 1
 
@@ -663,14 +741,17 @@ def generate_candidates(ctx, today, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, 
         last = _parse_date(rec.get("last_seen"))
         if last is None or last < since or not eligible(ip):
             continue
-        scan = rec.get("last_banner_ts") or last          # the ledger's flagged-banner scan time
-        base = (f"Shodan threat flag(s) {', '.join(rec.get('selectors') or ['?'])}; ledger first_seen "
-                f"{rec.get('first_seen')}, last_seen {rec.get('last_seen')}; last flagged banner "
-                f"{str(rec.get('last_banner_ts') or '?')[:19]}")
-        for (port, tp), info in (hit_ports.get(ip) or {(HOST_PORT, HOST_TRANSPORT): None}).items():
-            extra = f"; tags [{', '.join(sorted(info['tags']))}]" if info else ""
-            add(ip, port, tp, "compromise_tag", "high", base + extra,
-                key=",".join(rec.get("selectors") or []), severity="high", scan_ts=scan)
+        base = (f"Shodan threat flag(s) {', '.join(rec.get('selectors') or ['?'])}; ledger first_seen {rec.get('first_seen')}, "
+                f"last_seen {rec.get('last_seen')}; last flagged banner {str(rec.get('last_banner_ts') or '?')[:19]}")
+        key = ",".join(rec.get("selectors") or [])
+        ports = hit_ports.get(ip)
+        if ports:
+            for (port, tp), info in ports.items():
+                add(ip, port, tp, "compromise_tag", "high", base + f"; tags [{', '.join(sorted(info['tags']))}]",
+                    key=key, severity="high", scan_ts=info["banner_ts"] or last, event=last)      # THIS service's banner
+        else:
+            add(ip, HOST_PORT, HOST_TRANSPORT, "compromise_tag", "high", base, key=key, severity="high",
+                scan_ts=rec.get("last_banner_ts") or last, event=last)                             # host-level: ledger
 
     from ingest_shadowserver import classify_report
     for ip, events in shadowserver_recent(con, today, ss_parquet).items():
@@ -679,32 +760,94 @@ def generate_candidates(ctx, today, ledger_path=LEDGER_PATH, hits_dir=HITS_DIR, 
         by = {}
         for e in events:
             cls = classify_report(e["report_type"])
-            key = (HOST_PORT, HOST_TRANSPORT) if cls == "compromise" else (
-                int(e["port"]) if e.get("port") is not None else HOST_PORT, norm_transport(e.get("protocol")) if e.get("protocol") else HOST_TRANSPORT)
-            by.setdefault((cls,) + key, []).append(e)
+            k = (HOST_PORT, HOST_TRANSPORT) if cls == "compromise" else (
+                int(e["port"]) if e.get("port") is not None else HOST_PORT,
+                norm_transport(e.get("protocol")) if e.get("protocol") else HOST_TRANSPORT)
+            by.setdefault((cls,) + k, []).append(e)
         for (cls, port, tp), evs in by.items():
             types = sorted({e["report_type"] for e in evs})
             newest = max(evs, key=lambda e: str(e["timestamp"]))["timestamp"]
             tags = sorted({e["tag"] for e in evs if e.get("tag")})
             sev = min((str(e.get("severity") or "medium").lower() for e in evs), key=lambda s: SEVERITY_RANK.get(s, 9))
-            word = "COMPROMISE" if cls == "compromise" else "EXPOSURE"
             add(ip, port, tp, "shadowserver", "high" if cls == "compromise" else "medium",
-                f"Shadowserver {word} report(s) {', '.join(types)}; {len(evs)} event(s), newest {str(newest)[:19]}"
-                f"{'; tag ' + ', '.join(tags) if tags else ''}; severity {sev}",
-                key=f"{cls}:{','.join(types)}", severity=sev, scan_ts=newest)
+                f"Shadowserver {'COMPROMISE' if cls == 'compromise' else 'EXPOSURE'} report(s) {', '.join(types)}; "
+                f"{len(evs)} event(s), newest {str(newest)[:19]}{'; tag ' + ', '.join(tags) if tags else ''}; severity {sev}",
+                key=f"{cls}:{','.join(types)}", severity=sev, scan_ts=newest, event=_parse_ts(newest))
 
     for ip, e in ioc_hits(con, ioc_path).items():
         if not eligible(ip):
             continue
         add(ip, HOST_PORT, HOST_TRANSPORT, "ioc_match", "medium",
             f"Host listed by threat-intel feed(s) {', '.join(sorted(e['sources'])) or '?'}"
-            f"{'; CIDR range(s) ' + ', '.join(sorted(e['cidrs'])) if e['cidrs'] else ''}"
-            f"; active services {', '.join(sorted(e['services'])[:8])}",
-            key=",".join(sorted(e["sources"])), severity="medium", scan_ts=e["scan_ts"])
+            f"{'; CIDR range(s) ' + ', '.join(sorted(e['cidrs'])) if e['cidrs'] else ''}; active services "
+            f"{', '.join(sorted(e['services'])[:8])}", key=",".join(sorted(e["sources"])), severity="medium",
+            scan_ts=e["scan_ts"], event=e["scan_ts"])
     return cands, excluded, host
 
 
-# --- refresh -----------------------------------------------------------------------
+# --- migrations ----------------------------------------------------------------------
+
+def migrate_legacy_import(ctx, now):
+    """legacy_import_v1: copy a legacy `leads` table from the store (rows whose ids
+    are not present yet), transactionally, recorded in `migrations`."""
+    con = ctx.con
+    if migration_applied(con, "legacy_import_v1"):
+        return 0
+    n = 0
+    con.begin()
+    try:
+        if table_exists(con, "leads", "store") and "lead_id" in columns_of(con, "leads", "store"):
+            cols_in = set(columns_of(con, "leads", "store"))
+            sel = ", ".join(c if c in cols_in else
+                            ("TRUE" if c == "eligible" else "FALSE" if c == "needs_attribution_review" else "NULL") + f" AS {c}"
+                            for c in LEAD_COLUMNS)
+            con.execute(f"CREATE TEMP TABLE _legacy AS SELECT {sel} FROM store.leads WHERE lead_id IS NOT NULL "
+                        f"AND lead_id NOT IN (SELECT lead_id FROM leads)")
+            n = con.execute("SELECT count(*) FROM _legacy").fetchone()[0]
+            con.execute("INSERT INTO leads SELECT * FROM _legacy")
+            con.execute("INSERT INTO lead_events SELECT ?, lead_id, 'imported_legacy', status FROM _legacy", [now])
+            con.execute("DROP TABLE _legacy")
+        con.execute("INSERT INTO migrations VALUES ('legacy_import_v1', ?, ?)", [now, f"imported {n} row(s)"])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    if n:
+        log(f"migration legacy_import_v1: imported {n} legacy lead(s) from the store's leads table")
+    return n
+
+
+def migrate_shadowserver_ids(ctx, now):
+    """shadowserver_class_id_v1: re-key shadowserver leads in place (class in the id)."""
+    con = ctx.con
+    if migration_applied(con, "shadowserver_class_id_v1"):
+        return 0
+    rows = fetch_dicts(con, "SELECT lead_id, ip, port, transport, evidence_key FROM leads WHERE evidence_type = 'shadowserver'")
+    con.begin()
+    n = 0
+    try:
+        for r in rows:
+            cls = str(r.get("evidence_key") or "").split(":")[0] or "exposure"
+            new = lead_id(r["ip"], r["port"], r["transport"], "shadowserver", cls)
+            if new == r["lead_id"]:
+                continue
+            if con.execute("SELECT count(*) FROM leads WHERE lead_id = ?", [new]).fetchone()[0]:
+                continue                                    # already re-keyed by a newer row
+            con.execute("UPDATE leads SET lead_id = ? WHERE lead_id = ?", [new, r["lead_id"]])
+            con.execute("UPDATE lead_events SET lead_id = ? WHERE lead_id = ?", [new, r["lead_id"]])
+            con.execute("INSERT INTO lead_events VALUES (?, ?, 'id_migrated', ?)", [now, new, f"was {r['lead_id']} (class {cls})"])
+            n += 1
+        con.execute("INSERT INTO migrations VALUES ('shadowserver_class_id_v1', ?, ?)", [now, f"re-keyed {n}"])
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    if n:
+        log(f"migration shadowserver_class_id_v1: re-keyed {n} lead(s) in place")
+    return n
+
+
+# --- refresh -------------------------------------------------------------------------
 
 def _stamp(today, msg):
     return f"[{today.isoformat()}] {msg}"
@@ -718,99 +861,120 @@ def _ev(ops, now, lid, event, detail):
     ops.append(("INSERT INTO lead_events VALUES (?, ?, ?, ?)", [now, lid, event, detail]))
 
 
-def import_legacy(ctx, now):
-    """First run on a fresh leads.duckdb: copy a legacy `leads` table from the store
-    (transactionally). Old-scheme KEV ids are reconciled in refresh()."""
-    con = ctx.con
-    if not table_exists(con, "leads", "store"):
-        return 0
-    cols_in = set(columns_of(con, "leads", "store"))
-    if "lead_id" not in cols_in:
-        return 0
-    sel = ", ".join(c if c in cols_in else
-                    ("TRUE" if c == "eligible" else "FALSE" if c == "needs_attribution_review" else "NULL") + f" AS {c}"
-                    for c in LEAD_COLUMNS)
-    con.begin()
-    try:
-        con.execute(f"INSERT INTO leads SELECT {sel} FROM store.leads WHERE lead_id IS NOT NULL")
-        n = con.execute("SELECT count(*) FROM leads").fetchone()[0]
-        con.execute("INSERT INTO lead_events SELECT ?, lead_id, 'imported_legacy', status FROM leads", [now])
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    log(f"migration: imported {n} legacy lead(s) from the store's leads table")
-    return n
+def _org_label(org_id, org_name):
+    return f"{org_name} [{org_id}]" if org_id else (org_name or UNATTRIBUTED)
 
 
-def refresh(ctx, today, dry_run=False, **paths):
+def refresh(ctx, today, dry_run=False, registry_dir=REGISTRY_DIR, **paths):
     con = ctx.con
     now = datetime.now()
     state = ensure_leads_db(ctx)
     if state != "existing":
         log(f"leads table {state}")
-    if ctx.fresh and state == "created" and not dry_run:
-        import_legacy(ctx, now)
+    if not dry_run:
+        migrate_legacy_import(ctx, now)
+        migrate_shadowserver_ids(ctx, now)
+    reg = Registry(registry_dir)
     existing = {r["lead_id"]: r for r in fetch_dicts(con, "SELECT * FROM leads")}
-    cands, excluded, host = generate_candidates(ctx, today, **paths)
+    cands, excluded, host = generate_candidates(ctx, today, reg, **paths)
+    svc = service_rows(con, {c["ip"] for c in cands.values()} | {r["ip"] for r in existing.values()})
     counts = {"inserted": 0, "updated": 0, "reopened": 0, "remediated": 0, "preserved": 0, "owner_changed": 0,
-              "ineligible": 0, "eligible_again": 0, "migrated": 0}
+              "ineligible": 0, "eligible_again": 0, "migrated": 0, "review_flagged": 0}
     ops = []
 
-    # --- migration of legacy KEV ids (no CVE in the hash) onto per-CVE leads ---
-    legacy_map = {}     # new lead_id -> legacy row
+    def attribution_for(ip, port, tp, host_level, prev_row):
+        hi = host(ip)
+        obs = svc.get((ip, port, tp))
+        prev = None
+        if prev_row is not None:
+            prev = {k: prev_row.get(k) for k in ("org_id", "org_name", "sector", "attr_method", "attr_confidence", "attr_conflict")}
+            prev["review"] = bool(prev_row.get("needs_attribution_review"))
+        a = resolve_attribution(reg, ip, hi, obs, host_level, prev)
+        a["sector"] = a.get("sector") or TIER_TO_SECTOR.get(hi["tier"], "other")
+        return a
+
+    def ownership_change(old, a):
+        old_key, new_key = (old.get("org_id") or ""), (a["org_id"] or "")
+        if old_key != new_key:
+            return f"org_id {old_key or '(none)'} -> {new_key or '(none)'}"
+        if ATTR_RANK.get(a["attr_confidence"] or "none", 0) < ATTR_RANK.get(old.get("attr_confidence") or "none", 0):
+            return f"attribution confidence {old.get('attr_confidence')} -> {a['attr_confidence']}"
+        return None
+
+    # --- legacy KEV ids (no CVE in the hash): map only where the evidence names the CVE ---
+    legacy_map, legacy_keep = {}, {}
     for lid, old in list(existing.items()):
         if old["evidence_type"] in CVE_TYPES and not old.get("evidence_key") and lid not in cands:
+            named = set(_CVE_RE.findall(old.get("evidence") or ""))
             targets = [c for c in cands.values() if (c["ip"], c["port"], c["transport"], c["evidence_type"]) ==
                        (old["ip"], old["port"], old["transport"], old["evidence_type"])]
-            n_cves = len(set(_CVE_RE.findall(old.get("evidence") or "")))
+            mapped = 0
             for c in targets:
-                legacy_map[c["lead_id"]] = dict(old, _multi=n_cves > 1)
-            ops.append(("DELETE FROM leads WHERE lead_id = ?", [lid]))
-            _ev(ops, now, lid, "migrated_legacy_id", f"mapped to {len(targets)} per-CVE lead(s)")
-            del existing[lid]
-            counts["migrated"] += 1
+                if c["evidence_key"] in named:
+                    legacy_map[c["lead_id"]] = dict(old, _multi=len(named) > 1)
+                    mapped += 1
+                else:
+                    legacy_keep[c["lead_id"]] = old["lead_id"]           # new per-CVE lead: review, legacy kept
+            if mapped and mapped == len(targets):
+                ops.append(("DELETE FROM leads WHERE lead_id = ?", [lid]))
+                _ev(ops, now, lid, "migrated_legacy_id", f"mapped to {mapped} per-CVE lead(s)")
+                del existing[lid]
+                counts["migrated"] += 1
+            else:
+                reason = "no per-CVE lead names its CVE(s)" if not mapped else "some per-CVE leads not named"
+                ops.append(("UPDATE leads SET needs_attribution_review = TRUE, notes = ?, last_evaluated = ?, updated_at = ? "
+                            "WHERE lead_id = ?", [_append_note(old.get("notes") or "", _stamp(today, f"legacy lead kept: {reason}")),
+                                                 today, now, lid]))
+                _ev(ops, now, lid, "legacy_kept", reason)
+                del existing[lid]          # nothing else to reconcile for it this run
 
     for lid, c in cands.items():
         old = existing.get(lid)
         if old is None:
-            row = dict(c, prior_status=None, needs_attribution_review=False, first_seen=today,
-                       last_seen=c["obs_date"] or today, last_scan_ts=c["scan_ts"], last_evaluated=today,
-                       status="new", notified_via=None, notified_on=None, analyst=None, notes="", updated_at=now)
+            a = attribution_for(c["ip"], c["port"], c["transport"], c["host_level"], None)
+            row = dict(c, org_id=a["org_id"], org_name=a["org_name"], sector=a["sector"], attr_method=a["attr_method"],
+                       attr_confidence=a["attr_confidence"], attr_conflict=a["attr_conflict"],
+                       org_at_first_seen=_org_label(a["org_id"], a["org_name"]), prior_status=None,
+                       needs_attribution_review=a["review"], first_seen=today, last_seen=c["obs_date"] or today,
+                       last_scan_ts=c["scan_ts"], last_evaluated=today, status="new", notified_via=None, notified_on=None,
+                       analyst=None, notes="", updated_at=now)
+            if a["review"]:
+                row["notes"] = _stamp(today, f"attribution review: {a['reason']}")
+                counts["review_flagged"] += 1
             leg = legacy_map.get(lid)
             if leg:
-                if leg["status"] in MIGRATE_STATUSES:
-                    row.update(status=leg["status"], notified_via=leg.get("notified_via"),
-                               notified_on=leg.get("notified_on"), analyst=leg.get("analyst"),
-                               first_seen=leg.get("first_seen") or today,
-                               needs_attribution_review=bool(leg["_multi"]),
-                               notes=_append_note(leg.get("notes") or "",
-                                                  _stamp(today, f"migrated from legacy lead {leg['lead_id']} "
-                                                                f"(status {leg['status']} mapped"
-                                                                f"{'; legacy lead covered several CVEs — review' if leg['_multi'] else ''})")))
+                row.update(status=leg["status"], notified_via=leg.get("notified_via"), notified_on=leg.get("notified_on"),
+                           analyst=leg.get("analyst"), first_seen=leg.get("first_seen") or today,
+                           prior_status=leg.get("prior_status"),
+                           needs_attribution_review=row["needs_attribution_review"] or bool(leg["_multi"]),
+                           notes=_append_note(leg.get("notes") or "", _stamp(today, f"migrated from legacy lead {leg['lead_id']} "
+                                                                            f"(status {leg['status']} mapped"
+                                                                            f"{'; legacy lead covered several CVEs — review' if leg['_multi'] else ''})")))
                 _ev(ops, now, lid, "migrated_from", f"{leg['lead_id']} status {leg['status']}")
+            elif lid in legacy_keep:
+                row["needs_attribution_review"] = True
+                row["notes"] = _append_note(row["notes"], _stamp(today, f"legacy lead {legacy_keep[lid]} for this service did not "
+                                                                        f"name this CVE — review"))
+                _ev(ops, now, lid, "legacy_unmapped", legacy_keep[lid])
             counts["inserted"] += 1
             ops.append((f"INSERT INTO leads ({', '.join(LEAD_COLUMNS)}) VALUES ({', '.join('?' * len(LEAD_COLUMNS))})",
                         [row[k] for k in LEAD_COLUMNS]))
             _ev(ops, now, lid, "created", c["evidence"])
             continue
         status, notes = old["status"], old.get("notes") or ""
-        prior = old.get("prior_status")
+        prior, review = old.get("prior_status"), bool(old.get("needs_attribution_review"))
         notified_on, notified_via, analyst = old.get("notified_on"), old.get("notified_via"), old.get("analyst")
-        review = bool(old.get("needs_attribution_review"))
         old_ts = old.get("last_scan_ts") or _parse_ts(old.get("last_seen"))
         newer = c["scan_ts"] is not None and (old_ts is None or c["scan_ts"] > old_ts)
         last_scan = max(x for x in (old_ts, c["scan_ts"]) if x is not None) if (old_ts or c["scan_ts"]) else None
         last_seen = last_scan.date() if last_scan else old.get("last_seen")
-        owner_changed = bool(old.get("org_id")) and bool(c["org_id"]) and old["org_id"] != c["org_id"]
-        attr_drop = ATTR_RANK.get(c["attr_confidence"] or "none", 0) < ATTR_RANK.get(old.get("attr_confidence") or "none", 0)
-        if owner_changed or attr_drop:
-            why = (f"org_id {old.get('org_id')} -> {c['org_id']}" if owner_changed else
-                   f"attribution confidence {old.get('attr_confidence')} -> {c['attr_confidence']}")
-            _ev(ops, now, lid, "owner_changed",
-                json.dumps({"reason": why, "old_org_id": old.get("org_id"), "old_org_name": old.get("org_name"),
-                            "old_status": status, "notified_on": str(notified_on) if notified_on else None,
-                            "notified_via": notified_via, "analyst": analyst}))
+        a = attribution_for(c["ip"], c["port"], c["transport"], c["host_level"], old)
+        why = ownership_change(old, a)
+        if why:
+            _ev(ops, now, lid, "owner_changed", json.dumps({"reason": why, "old_org_id": old.get("org_id"),
+                                                             "old_org_name": old.get("org_name"), "old_status": status,
+                                                             "notified_on": str(notified_on) if notified_on else None,
+                                                             "notified_via": notified_via, "analyst": analyst}))
             notes = _append_note(notes, _stamp(today, f"attribution changed ({why}); episode closed — was {status}"
                                                       f"{', notified ' + str(notified_on) + ' via ' + str(notified_via) if notified_on else ''}"
                                                       f"; needs attribution review"))
@@ -831,29 +995,34 @@ def refresh(ctx, today, dry_run=False, **paths):
             counts["preserved"] += 1
         else:
             counts["updated"] += 1
-        # eligibility flips never touch status
+        attr_changed = (old.get("attr_method"), old.get("attr_conflict") or "", old.get("org_id") or "") != \
+            (a["attr_method"], a["attr_conflict"] or "", a["org_id"] or "")
+        if a["review"] and not review and (attr_changed or why):
+            review = True
+            counts["review_flagged"] += 1
+            notes = _append_note(notes, _stamp(today, f"attribution review: {a['reason']}"))
         if bool(old.get("eligible", True)) != c["eligible"]:
             if not c["eligible"]:
-                prior = status
-                counts["ineligible"] += 1
+                prior, counts["ineligible"] = status, counts["ineligible"] + 1
                 _ev(ops, now, lid, "ineligible", c["eligibility_reason"])
             else:
                 counts["eligible_again"] += 1
                 _ev(ops, now, lid, "eligible_again", c["eligibility_reason"])
             notes = _append_note(notes, _stamp(today, f"{'ineligible' if not c['eligible'] else 'eligible again'}: "
                                                       f"{c['eligibility_reason']} (status {status} kept)"))
-        ops.append(("UPDATE leads SET last_seen = ?, last_scan_ts = ?, last_evaluated = ?, evidence = ?, evidence_key = ?, "
-                    "confidence = ?, severity = ?, tier = ?, sector = ?, org_id = ?, org_name = ?, attr_method = ?, "
-                    "attr_confidence = ?, eligible = ?, eligibility_reason = ?, prior_status = ?, "
-                    "needs_attribution_review = ?, status = ?, notes = ?, notified_on = ?, notified_via = ?, "
-                    "analyst = ?, updated_at = ? WHERE lead_id = ?",
-                    [last_seen, last_scan, today, c["evidence"], c["evidence_key"], c["confidence"], c["severity"],
-                     c["tier"], c["sector"], c["org_id"], c["org_name"], c["attr_method"], c["attr_confidence"],
-                     c["eligible"], c["eligibility_reason"], prior, review, status, notes, notified_on, notified_via,
-                     analyst, now, lid]))
+        last_event = c["last_event"] or old.get("last_event")
+        ops.append(("UPDATE leads SET last_seen = ?, last_scan_ts = ?, last_event = ?, last_evaluated = ?, evidence = ?, "
+                    "evidence_key = ?, confidence = ?, severity = ?, tier = ?, sector = ?, org_id = ?, org_name = ?, "
+                    "attr_method = ?, attr_confidence = ?, attr_conflict = ?, eligible = ?, eligibility_reason = ?, "
+                    "prior_status = ?, needs_attribution_review = ?, status = ?, notes = ?, notified_on = ?, "
+                    "notified_via = ?, analyst = ?, updated_at = ? WHERE lead_id = ?",
+                    [last_seen, last_scan, last_event, today, c["evidence"], c["evidence_key"], c["confidence"], c["severity"],
+                     c["tier"], a["sector"], a["org_id"], a["org_name"], a["attr_method"], a["attr_confidence"],
+                     a["attr_conflict"], c["eligible"], c["eligibility_reason"], prior, review, status, notes,
+                     notified_on, notified_via, analyst, now, lid]))
 
-    # --- existing leads without a candidate: eligibility re-evaluated, remediation ---
-    es = {(r["ip"], r["port"], r["transport"]): r["status"] for r in
+    # --- existing leads without a candidate: ownership + eligibility + remediation ---
+    es = {(canon_ip(r["ip"]), r["port"], norm_transport(r["transport"])): r["status"] for r in
           fetch_dicts(con, "SELECT ip, port, transport, status FROM store.exposure_status")}
     by_ip = {}
     for (ip, port, tp), st in es.items():
@@ -862,33 +1031,54 @@ def refresh(ctx, today, dry_run=False, **paths):
         if lid in cands:
             continue
         hi = host(old["ip"])
+        status, notes, prior = old["status"], old.get("notes") or "", old.get("prior_status")
+        review = bool(old.get("needs_attribution_review"))
+        notified_on, notified_via, analyst = old.get("notified_on"), old.get("notified_via"), old.get("analyst")
+        a = attribution_for(old["ip"], old["port"], norm_transport(old["transport"]), old["transport"] == HOST_TRANSPORT, old)
+        why = ownership_change(old, a)
+        if why:
+            _ev(ops, now, lid, "owner_changed", json.dumps({"reason": why, "old_org_id": old.get("org_id"),
+                                                             "old_org_name": old.get("org_name"), "old_status": status,
+                                                             "notified_on": str(notified_on) if notified_on else None,
+                                                             "notified_via": notified_via, "analyst": analyst}))
+            notes = _append_note(notes, _stamp(today, f"attribution changed ({why}); episode closed — was {status}; "
+                                                      f"needs attribution review"))
+            prior, status, review = status, "new", True
+            notified_on = notified_via = analyst = None
+            counts["owner_changed"] += 1
+        elif a["review"] and not review and (old.get("attr_method"), old.get("attr_conflict") or "") != \
+                (a["attr_method"], a["attr_conflict"] or ""):
+            review = True
+            counts["review_flagged"] += 1
+            notes = _append_note(notes, _stamp(today, f"attribution review: {a['reason']}"))
         elig, reason = bool(old.get("eligible", True)), old.get("eligibility_reason")
-        notes, prior = old.get("notes") or "", old.get("prior_status")
         if hi["known"] and hi["eligible"] != elig:
             if not hi["eligible"]:
-                prior, counts["ineligible"] = old["status"], counts["ineligible"] + 1
+                prior, counts["ineligible"] = status, counts["ineligible"] + 1
                 _ev(ops, now, lid, "ineligible", hi["eligibility_reason"])
             else:
                 counts["eligible_again"] += 1
                 _ev(ops, now, lid, "eligible_again", hi["eligibility_reason"])
             notes = _append_note(notes, _stamp(today, f"{'ineligible' if not hi['eligible'] else 'eligible again'}: "
-                                                      f"{hi['eligibility_reason']} (status {old['status']} kept)"))
+                                                      f"{hi['eligibility_reason']} (status {status} kept)"))
             elig, reason = hi["eligible"], hi["eligibility_reason"]
-        ops.append(("UPDATE leads SET last_evaluated = ?, eligible = ?, eligibility_reason = ?, prior_status = ?, "
-                    "notes = ?, updated_at = ? WHERE lead_id = ?", [today, elig, reason, prior, notes, now, lid]))
-        if old["status"] not in ("notified", "acknowledged"):
-            continue
-        if old["transport"] == HOST_TRANSPORT:
-            sts = by_ip.get(old["ip"], [])
-            is_gone = bool(sts) and all(s == "gone" for s in sts)
-        else:
-            is_gone = es.get((old["ip"], old["port"], old["transport"])) == "gone"
-        if is_gone:
-            counts["remediated"] += 1
-            ops.append(("UPDATE leads SET status = 'remediated', prior_status = ?, notes = ?, updated_at = ? WHERE lead_id = ?",
-                        [old["status"], _append_note(notes, _stamp(today, f"remediated: service gone from exposure_status "
-                                                                          f"(was {old['status']})")), now, lid]))
-            _ev(ops, now, lid, "remediated", old["status"])
+        if status in ("notified", "acknowledged"):
+            if old["transport"] == HOST_TRANSPORT:
+                sts = by_ip.get(old["ip"], [])
+                is_gone = bool(sts) and all(s == "gone" for s in sts)
+            else:
+                is_gone = es.get((old["ip"], old["port"], norm_transport(old["transport"]))) == "gone"
+            if is_gone:
+                counts["remediated"] += 1
+                prior, status = status, "remediated"
+                notes = _append_note(notes, _stamp(today, f"remediated: service gone from exposure_status (was {prior})"))
+                _ev(ops, now, lid, "remediated", prior)
+        ops.append(("UPDATE leads SET last_evaluated = ?, eligible = ?, eligibility_reason = ?, prior_status = ?, notes = ?, "
+                    "org_id = ?, org_name = ?, sector = ?, attr_method = ?, attr_confidence = ?, attr_conflict = ?, "
+                    "needs_attribution_review = ?, status = ?, notified_on = ?, notified_via = ?, analyst = ?, updated_at = ? "
+                    "WHERE lead_id = ?",
+                    [today, elig, reason, prior, notes, a["org_id"], a["org_name"], a["sector"], a["attr_method"],
+                     a["attr_confidence"], a["attr_conflict"], review, status, notified_on, notified_via, analyst, now, lid]))
 
     if dry_run:
         log(f"DRY-RUN: {len(ops)} change(s) not applied")
@@ -896,37 +1086,36 @@ def refresh(ctx, today, dry_run=False, **paths):
         commit_with_snapshot(ctx, ops)
     log(f"refresh {today}: {len(cands)} candidate(s); inserted {counts['inserted']}, updated {counts['updated']}, "
         f"reopened {counts['reopened']}, remediated {counts['remediated']}, owner-changed {counts['owner_changed']}, "
-        f"newly ineligible {counts['ineligible']}, eligible again {counts['eligible_again']}, "
-        f"migrated legacy ids {counts['migrated']}, analyst/remediated status preserved {counts['preserved']}")
+        f"review-flagged {counts['review_flagged']}, newly ineligible {counts['ineligible']}, eligible again "
+        f"{counts['eligible_again']}, migrated legacy ids {counts['migrated']}, analyst/remediated status preserved "
+        f"{counts['preserved']}; registry {'generation ' + str(reg.generation) if reg.available else 'UNAVAILABLE'}")
     log("excluded (aggregate only): " + (", ".join(f"{k}={v}" for k, v in excluded.items() if v) or "none"))
     return counts, excluded
 
 
 def print_summary(con):
-    rows = con.execute("SELECT tier, evidence_type, status, count(*) FROM leads WHERE eligible "
-                       "GROUP BY 1, 2, 3 ORDER BY 1, 2, 3").fetchall()
+    rows = con.execute("SELECT tier, evidence_type, status, count(*) FROM leads WHERE eligible GROUP BY 1, 2, 3 ORDER BY 1, 2, 3").fetchall()
     print(f"\n{'tier':24} {'evidence_type':16} {'status':16} {'leads':>6}")
     for tier, et, st, n in rows:
         print(f"{tier:24} {et:16} {st:16} {n:6}")
-    tot = con.execute("SELECT count(*), count(DISTINCT ip), count(DISTINCT org_name), "
-                      "sum((NOT eligible)::int), sum(needs_attribution_review::int) FROM leads").fetchone()
+    tot = con.execute("SELECT count(*), count(DISTINCT ip), count(DISTINCT org_name), sum((NOT eligible)::int), "
+                      "sum(needs_attribution_review::int), sum((coalesce(attr_conflict, '') <> '')::int) FROM leads").fetchone()
     attr = con.execute("SELECT attr_confidence, count(*) FROM leads WHERE eligible GROUP BY 1 ORDER BY 2 DESC").fetchall()
-    print(f"\ntotal {tot[0]} lead(s) on {tot[1]} host(s) / {tot[2]} org(s); ineligible (hidden) {tot[3] or 0}; "
-          f"needs attribution review {tot[4] or 0}; attribution confidence: "
-          + ", ".join(f"{c or 'none'}={n}" for c, n in attr))
+    meth = con.execute("SELECT attr_method, count(*) FROM leads WHERE eligible GROUP BY 1 ORDER BY 2 DESC").fetchall()
+    print(f"\ntotal {tot[0]} lead(s) on {tot[1]} host(s) / {tot[2]} org(s); ineligible (hidden) {tot[3] or 0}; needs attribution "
+          f"review {tot[4] or 0} (registry conflicts {tot[5] or 0}); attribution confidence: "
+          + ", ".join(f"{c or 'none'}={n}" for c, n in attr) + "; methods: " + ", ".join(f"{m or '-'}={n}" for m, n in meth))
 
 
-# --- list / set / digest -------------------------------------------------------------
+# --- list / set / digest ---------------------------------------------------------------
 
 RANK_SQL = """
 WITH svc AS (
   SELECT lo.ip, lo.port, lo.transport, max(v.epss) AS epss
-  FROM store.latest_observed lo JOIN store.vulns v ON v.observation_id = lo.observation_id AND v.date = lo.date
-  GROUP BY 1, 2, 3),
+  FROM store.latest_observed lo JOIN store.vulns v ON v.observation_id = lo.observation_id AND v.date = lo.date GROUP BY 1, 2, 3),
 cve AS (
   SELECT lo.ip, lo.port, lo.transport, v.cve, max(v.epss) AS epss
-  FROM store.latest_observed lo JOIN store.vulns v ON v.observation_id = lo.observation_id AND v.date = lo.date
-  GROUP BY 1, 2, 3, 4)
+  FROM store.latest_observed lo JOIN store.vulns v ON v.observation_id = lo.observation_id AND v.date = lo.date GROUP BY 1, 2, 3, 4)
 SELECT l.*, COALESCE(c.epss, s.epss) AS epss
 FROM leads l
 LEFT JOIN cve c ON c.ip = l.ip AND c.port = l.port AND c.transport = l.transport AND c.cve = l.evidence_key
@@ -938,15 +1127,16 @@ ORDER BY {rank_case}, {sev_case}, COALESCE(c.epss, s.epss) DESC NULLS LAST, {tie
 
 
 def _case(col, mapping, default):
-    return ("CASE " + " ".join(f"WHEN {col} = '{k}' THEN {v}" for k, v in mapping.items()) + f" ELSE {default} END")
+    return "CASE " + " ".join(f"WHEN {col} = '{k}' THEN {v}" for k, v in mapping.items()) + f" ELSE {default} END"
 
 
-def ranked_leads(ctx, tier=None, status=None, sector=None, evidence=None, org=None, limit=None, ip=None,
-                 statuses=None, include_ineligible=False):
+def ranked_leads(ctx, tier=None, status=None, sector=None, evidence=None, org=None, limit=None, ip=None, statuses=None,
+                 include_ineligible=False):
     conds, params = [], []
     if not include_ineligible:
         conds.append("l.eligible")
-    for col, val in (("l.tier", tier), ("l.status", status), ("l.sector", sector), ("l.evidence_type", evidence), ("l.ip", ip)):
+    for col, val in (("l.tier", tier), ("l.status", status), ("l.sector", sector), ("l.evidence_type", evidence),
+                     ("l.ip", canon_ip(ip) if ip else None)):
         if val:
             conds.append(f"{col} = ?")
             params.append(val)
@@ -957,34 +1147,30 @@ def ranked_leads(ctx, tier=None, status=None, sector=None, evidence=None, org=No
         conds.append("l.status IN (" + ", ".join("?" * len(statuses)) + ")")
         params += list(statuses)
     sql = RANK_SQL.format(where=("WHERE " + " AND ".join(conds)) if conds else "",
-                          rank_case=_case("l.evidence_type", EVIDENCE_RANK, 9),
-                          sev_case=_case("l.severity", SEVERITY_RANK, 9),
-                          tier_case=_case("l.tier", TIER_RANK, 9),
-                          limit=f"LIMIT {int(limit)}" if limit else "")
+                          rank_case=_case("l.evidence_type", EVIDENCE_RANK, 9), sev_case=_case("l.severity", SEVERITY_RANK, 9),
+                          tier_case=_case("l.tier", TIER_RANK, 9), limit=f"LIMIT {int(limit)}" if limit else "")
     return fetch_dicts(ctx.con, sql, params)
 
 
 def print_list(rows):
-    print(f"{'lead_id':16} {'tier':22} {'evidence':14} {'conf':6} {'ip':15} {'port':>5} {'tp':4} "
-          f"{'status':12} {'first':10} {'last':10} {'epss':>5} {'attr':16} {'flags':5}  org")
+    print(f"{'lead_id':16} {'tier':22} {'evidence':14} {'conf':6} {'ip':15} {'port':>5} {'tp':4} {'status':12} {'first':10} "
+          f"{'last':10} {'epss':>5} {'attr':22} {'flags':5}  org")
     for r in rows:
-        attr = f"{r.get('attr_confidence') or 'none'}/{(r.get('attr_method') or '-')[:9]}"
-        flags = ("R" if r.get("needs_attribution_review") else "") + ("" if r.get("eligible", True) else "X")
-        print(f"{r['lead_id']:16} {(r['tier'] or ''):22} {r['evidence_type']:14} {r['confidence']:6} "
-              f"{r['ip']:15} {r['port']:5} {norm_transport(r.get('transport')):4} {r['status']:12} "
-              f"{r['first_seen']} {r['last_seen']} {_fmt_epss(r.get('epss')):>5} {attr:16} {flags:5}  "
-              f"{(r['org_name'] or UNATTRIBUTED)[:36]}")
+        attr = f"{r.get('attr_confidence') or 'none'}/{(r.get('attr_method') or '-')[:16]}"
+        flags = ("R" if r.get("needs_attribution_review") else "") + ("C" if r.get("attr_conflict") else "") + \
+                ("" if r.get("eligible", True) else "X")
+        print(f"{r['lead_id']:16} {(r['tier'] or ''):22} {r['evidence_type']:14} {r['confidence']:6} {r['ip']:15} {r['port']:5} "
+              f"{norm_transport(r.get('transport')):4} {r['status']:12} {r['first_seen']} {r['last_seen']} "
+              f"{_fmt_epss(r.get('epss')):>5} {attr:22} {flags:5}  {(r['org_name'] or UNATTRIBUTED)[:36]}")
     print(f"{len(rows)} lead(s)")
 
 
 def set_status(ctx, lid, status=None, via=None, analyst=None, note=None, today=None, review_cleared=False,
-               dry_run=False):
-    """Analyst change: UPDATE + event + snapshot inside ONE transaction (snapshot
-    before commit; the pointer is published only after commit)."""
+               needs_review=False, dry_run=False):
     if status is not None and status not in STATUSES:
         raise SystemExit(f"ERROR: status must be one of {', '.join(STATUSES)}")
-    if status is None and not review_cleared and not note:
-        raise SystemExit("ERROR: nothing to set (give --status, --note and/or --review-cleared)")
+    if status is None and not (review_cleared or needs_review or note):
+        raise SystemExit("ERROR: nothing to set (give --status, --note, --review-cleared or --needs-review)")
     con = ctx.con
     today = today or date.today()
     old = fetch_dicts(con, "SELECT * FROM leads WHERE lead_id = ?", [lid])
@@ -994,7 +1180,7 @@ def set_status(ctx, lid, status=None, via=None, analyst=None, note=None, today=N
     new_status = status or old["status"]
     msg = (f"{old['status']} -> {new_status}" if status else "note") + (f" via {via}" if via else "") \
         + (f" by {analyst}" if analyst else "") + (f": {note}" if note else "") \
-        + ("; attribution review cleared" if review_cleared else "")
+        + ("; attribution review cleared" if review_cleared else "") + ("; flagged for attribution review" if needs_review else "")
     notes = _append_note(old.get("notes") or "", _stamp(today, msg))
     sets, params = ["status = ?", "notes = ?", "updated_at = ?"], [new_status, notes, datetime.now()]
     if status and status != old["status"]:
@@ -1007,12 +1193,15 @@ def set_status(ctx, lid, status=None, via=None, analyst=None, note=None, today=N
         sets.append("notified_on = ?"); params.append(today)
     if review_cleared:
         sets.append("needs_attribution_review = FALSE")
+    if needs_review:
+        sets.append("needs_attribution_review = TRUE")
     params.append(lid)
     if dry_run:
         log(f"DRY-RUN: would apply '{msg}' to {lid}")
         return
+    kind = "status" if status else ("review_cleared" if review_cleared else "review_flagged" if needs_review else "note")
     ops = [(f"UPDATE leads SET {', '.join(sets)} WHERE lead_id = ?", params),
-           ("INSERT INTO lead_events VALUES (?, ?, ?, ?)", [datetime.now(), lid, "review_cleared" if review_cleared and not status else "status", msg])]
+           ("INSERT INTO lead_events VALUES (?, ?, ?, ?)", [datetime.now(), lid, kind, msg])]
     commit_with_snapshot(ctx, ops, snapshot_before_commit=True)
     log(f"{lid}: {msg} ({old['ip']}:{old['port']} {old['evidence_type']}, {old.get('org_name') or UNATTRIBUTED})")
 
@@ -1020,25 +1209,25 @@ def set_status(ctx, lid, status=None, via=None, analyst=None, note=None, today=N
 def _stats(vals):
     if not vals:
         return "n/a"
-    return (f"n={len(vals)}, median {statistics.median(vals):.0f}d, mean {statistics.mean(vals):.1f}d, "
-            f"min {min(vals)}d, max {max(vals)}d")
+    return (f"n={len(vals)}, median {statistics.median(vals):.0f}d, mean {statistics.mean(vals):.1f}d, min {min(vals)}d, "
+            f"max {max(vals)}d")
 
 
 def digest(ctx, today, weekly=False):
     con = ctx.con
     since = today - timedelta(days=7) if weekly else None
     leads = fetch_dicts(con, "SELECT * FROM leads WHERE eligible AND tier NOT IN ('residential', 'honeypot')")
-    life = {(r["ip"], r["port"], r["transport"]): r for r in
+    life = {(canon_ip(r["ip"]), r["port"], norm_transport(r["transport"])): r for r in
             fetch_dicts(con, "SELECT ip, port, transport, first_seen, last_seen FROM store.lifecycle")}
-    es = {(r["ip"], r["port"], r["transport"]): r["status"] for r in
+    es = {(canon_ip(r["ip"]), r["port"], norm_transport(r["transport"])): r["status"] for r in
           fetch_dicts(con, "SELECT ip, port, transport, status FROM store.exposure_status")}
     newest = con.execute("SELECT max(date) FROM store.observations").fetchone()[0]
     hidden = con.execute("SELECT count(*) FROM leads WHERE NOT eligible").fetchone()[0]
     per = {}
     for l in leads:
-        s = per.setdefault(l["sector"] or "other", {"new": 0, "queued": 0, "notified": 0, "acknowledged": 0,
-                                                    "remediated": 0, "other": 0, "gone_days": [], "notified_to_gone": [],
-                                                    "open_age": [], "leads": 0, "attr": {}, "review": 0})
+        s = per.setdefault(l["sector"] or "other", {"new": 0, "queued": 0, "notified": 0, "acknowledged": 0, "remediated": 0,
+                                                    "other": 0, "gone_days": [], "notified_to_gone": [], "open_age": [],
+                                                    "leads": 0, "attr": {}, "review": 0})
         s["leads"] += 1
         s["review"] += int(bool(l.get("needs_attribution_review")))
         ac = l.get("attr_confidence") or "none"
@@ -1064,11 +1253,11 @@ def digest(ctx, today, weekly=False):
             s["open_age"].append(max(0, (today - l["first_seen"]).days))
     out = [f"# Leads digest — {'week ending ' if weekly else 'as of '}{today}", "",
            f"Store newest day: {newest}. Residential/honeypot tiers excluded; {hidden} ineligible lead(s) hidden. "
-           f"{'Counts are for the last 7 days; ' if weekly else ''}"
-           "days-to-disappear = days a lead's service stayed visible after we raised the lead (lifecycle / "
-           "exposure_status = 'gone'); notified-to-gone = days from notification to the service disappearing. A "
-           "disappeared service is *no longer observed* — the best passive proxy for remediation we have, not proof of it.",
-           "", "| sector | leads | new | queued | notified | acknowledged | remediated | other | needs review | attribution (conf=n) |",
+           f"{'Counts are for the last 7 days; ' if weekly else ''}days-to-disappear = days a lead's service stayed visible "
+           "after we raised the lead (lifecycle / exposure_status = 'gone'); notified-to-gone = days from notification to the "
+           "service disappearing. A disappeared service is *no longer observed* — the best passive proxy for remediation we "
+           "have, not proof of it.", "",
+           "| sector | leads | new | queued | notified | acknowledged | remediated | other | needs review | attribution (conf=n) |",
            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for sec in sorted(per):
         s = per[sec]
@@ -1078,8 +1267,8 @@ def digest(ctx, today, weekly=False):
     out += ["", "## Remediation measurement", ""]
     for sec in sorted(per):
         s = per[sec]
-        out.append(f"- **{sec}** — days-to-disappear: {_stats(s['gone_days'])}; notified-to-gone: "
-                   f"{_stats(s['notified_to_gone'])}; still-open lead age: {_stats(s['open_age'])}")
+        out.append(f"- **{sec}** — days-to-disappear: {_stats(s['gone_days'])}; notified-to-gone: {_stats(s['notified_to_gone'])}; "
+                   f"still-open lead age: {_stats(s['open_age'])}")
     if not per:
         out.append("- no leads yet — run `leads.py refresh`")
     ev = con.execute("SELECT evidence_type, confidence, count(*) FROM leads WHERE eligible GROUP BY 1, 2 ORDER BY 3 DESC").fetchall()
@@ -1092,16 +1281,16 @@ def digest(ctx, today, weekly=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Persisted leads over the exposure store.")
-    ap.add_argument("--db", default=DB_PATH, help="exposure store (read; leads copy published into it)")
-    ap.add_argument("--leads-dir", default=LEADS_DIR, help="authoritative leads dir (leads.duckdb, snapshots/, CURRENT)")
-    ap.add_argument("--today", help="YYYY-MM-DD (default: today)")
+    ap.add_argument("--db", default=DB_PATH)
+    ap.add_argument("--leads-dir", default=LEADS_DIR)
+    ap.add_argument("--today")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("refresh")
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--ledger", default=LEDGER_PATH)
     r.add_argument("--hits-dir", default=HITS_DIR)
     r.add_argument("--ioc", default=IOC_PATH)
-    r.add_argument("--attribution", default=ATTRIBUTION_PARQUET)
+    r.add_argument("--registry-dir", default=REGISTRY_DIR, help="store/registry (CURRENT pointer + generations)")
     r.add_argument("--ss-parquet", default=SS_EVENTS_PARQUET)
     ls = sub.add_parser("list")
     for opt in ("--tier", "--status", "--sector", "--evidence", "--org", "--ip"):
@@ -1114,7 +1303,8 @@ def main(argv=None):
     st.add_argument("--via")
     st.add_argument("--analyst")
     st.add_argument("--note")
-    st.add_argument("--review-cleared", action="store_true", help="clear needs_attribution_review")
+    st.add_argument("--review-cleared", action="store_true")
+    st.add_argument("--needs-review", action="store_true")
     st.add_argument("--dry-run", action="store_true")
     dg = sub.add_parser("digest")
     dg.add_argument("--weekly", action="store_true")
@@ -1123,12 +1313,11 @@ def main(argv=None):
     today = _parse_date(args.today) if args.today else date.today()
     if args.today and today is None:
         ap.error("--today must be YYYY-MM-DD")
-
     if args.cmd == "refresh":
         ctx = open_ctx(args.db, args.leads_dir, write=True)
         try:
-            refresh(ctx, today, dry_run=args.dry_run, ledger_path=args.ledger, hits_dir=args.hits_dir,
-                    ioc_path=args.ioc, attribution_parquet=args.attribution, ss_parquet=args.ss_parquet)
+            refresh(ctx, today, dry_run=args.dry_run, registry_dir=args.registry_dir, ledger_path=args.ledger,
+                    hits_dir=args.hits_dir, ioc_path=args.ioc, ss_parquet=args.ss_parquet)
             print_summary(ctx.con)
         finally:
             ctx.close()
@@ -1138,15 +1327,15 @@ def main(argv=None):
         try:
             ensure_leads_db(ctx)
             set_status(ctx, args.lead_id, args.status, args.via, args.analyst, args.note, today,
-                       review_cleared=args.review_cleared, dry_run=args.dry_run)
+                       review_cleared=args.review_cleared, needs_review=args.needs_review, dry_run=args.dry_run)
         finally:
             ctx.close()
         return 0
     ctx = open_ctx(args.db, args.leads_dir, write=False)
     try:
         if args.cmd == "list":
-            print_list(ranked_leads(ctx, args.tier, args.status, args.sector, args.evidence, args.org, args.limit,
-                                    ip=args.ip, include_ineligible=args.include_ineligible))
+            print_list(ranked_leads(ctx, args.tier, args.status, args.sector, args.evidence, args.org, args.limit, ip=args.ip,
+                                    include_ineligible=args.include_ineligible))
         elif args.cmd == "digest":
             md = digest(ctx, today, weekly=args.weekly)
             if args.out:
