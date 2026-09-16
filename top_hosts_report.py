@@ -205,7 +205,9 @@ def write_csv(path, sections, verify=None):
             "la_confidence", "la_votes", "metro", "netblock", "netblock_registrant", "netblock_state",
             "abuse_contacts", "technical_contacts", "current_hostnames", "shodan_last_update",
             "kev_still_listed", "kev_no_longer_listed", "current_ports", "dwell_days", "ransomware_kev",
-            "kev_due_dates", "cert_expires", "cert_expired", "licensed_flags", "passive_dns"]
+            "kev_due_dates", "cert_expires", "cert_expired", "licensed_flags", "passive_dns",
+            "gti_worst_cve", "gti_risk_rating", "gti_priority", "gti_exploit_availability", "gti_consequence",
+            "gti_p0_kevs", "gti_actors"]
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(cols)
@@ -223,8 +225,9 @@ def write_csv(path, sections, verify=None):
 
 def verify_cols(v):
     if not v:
-        return [""] * 21
+        return [""] * 27
     la, cur, own, risk = v["louisiana"], v["currency"], v["owner"], v["risk"]
+    gv = risk.get("gti_vulns") or {}
     return [la["confidence"], " ".join(la["votes_for"]), la.get("rdns_city") or la.get("netblock_city_code") or "",
             own.get("netblock") or "", own.get("registrant") or "", la.get("netblock_state") or "",
             " ".join(own.get("abuse_contacts") or []), " ".join(own.get("technical_contacts") or []),
@@ -234,7 +237,10 @@ def verify_cols(v):
             " ".join(risk.get("ransomware_kev") or []),
             " ".join(f"{k}:{d}" for k, d in (risk.get("kev_due_dates") or {}).items()),
             risk.get("cert_expires") or "", risk.get("cert_expired"),
-            " | ".join(v.get("licensed_flags") or []), " ".join(own.get("passive_dns") or [])]
+            " | ".join(v.get("licensed_flags") or []), " ".join(own.get("passive_dns") or []),
+            gv.get("cve") or "", gv.get("risk_rating") or "", gv.get("priority") or "",
+            gv.get("exploit_availability") or "", gv.get("consequence") or "", gv.get("p0", ""),
+            " ".join(gv.get("actors") or [])]
 
 
 def write_pdf(path, sections, totals, meta, marking, per_tier, residential_excluded, n_scored, verify=None):

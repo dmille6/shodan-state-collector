@@ -85,8 +85,12 @@ def gti_ip(ip, key):
            "as_owner": a.get("as_owner"), "asn": a.get("asn"), "country": a.get("country"),
            "network": a.get("network"), "tags": a.get("tags") or [],
            "last_analysis_date": a.get("last_analysis_date"),
+           # IP objects carry GTI's threat_severity block (gti_assessment is only
+           # on files/URLs/domains); keep both in case the API adds it.
            "gti_assessment": (a.get("gti_assessment") or {}).get("verdict", {}).get("value") if a.get("gti_assessment") else None,
-           "threat_severity": (a.get("gti_assessment") or {}).get("threat_score", {}).get("value") if a.get("gti_assessment") else None,
+           "threat_severity": (a.get("threat_severity") or {}).get("threat_severity_level"),
+           "threat_severity_data": (a.get("threat_severity") or {}).get("threat_severity_data") or {},
+           "threat_severity_note": (a.get("threat_severity") or {}).get("level_description"),
            "resolutions": [], "communicating_files": 0, "communicating_sample": []}
     try:
         _, r = http("GET", f"https://www.virustotal.com/api/v3/ip_addresses/{ip}/resolutions?limit=20", h)
@@ -104,6 +108,37 @@ def gti_ip(ip, key):
     except Exception as exc:
         out["communicating_error"] = str(exc)[:80]
     return out
+
+
+def gti_vuln(cve, key):
+    """GTI (Mandiant) vulnerability intelligence for one CVE: risk rating,
+    exploitation state, exploit availability, actors. Needs the
+    'vulnerabilities' privilege (GTI Enterprise)."""
+    h = {"x-apikey": key}
+    q = urllib.parse.quote(f"collection_type:vulnerability name:{cve}")
+    _, d = http("GET", f"https://www.virustotal.com/api/v3/collections?filter={q}&limit=1", h)
+    items = d.get("data") or []
+    if not items:
+        return {"ok": True, "found": False}
+    a = items[0].get("attributes") or {}
+    ex = a.get("exploitation") or {}
+    kev = a.get("cisa_known_exploited") or {}
+    def day(ts):
+        return dt.datetime.fromtimestamp(ts, dt.timezone.utc).date().isoformat() if ts else None
+    summary = (a.get("executive_summary") or "").strip()
+    first_line = summary.split("\n")[0].lstrip("* ").strip() if summary else ""
+    return {"ok": True, "found": True, "id": items[0].get("id"), "risk_rating": a.get("risk_rating") or None,
+            "predicted_risk_rating": a.get("predicted_risk_rating") or None, "priority": a.get("priority") or None,
+            "exploitation_state": a.get("exploitation_state") or None,
+            "exploit_availability": a.get("exploit_availability") or None,
+            "exploitation_consequence": a.get("exploitation_consequence") or None,
+            "exploitation_vectors": a.get("exploitation_vectors") or [],
+            "first_exploitation": day(ex.get("first_exploitation")), "exploit_release": day(ex.get("exploit_release_date")),
+            "ransomware_use": kev.get("ransomware_use"), "kev_due": day(kev.get("due_date")),
+            "available_mitigation": a.get("available_mitigation") or [], "days_to_patch": a.get("days_to_patch"),
+            "actors": [x.get("name") or x.get("id") for x in (a.get("merged_actors") or [])][:8],
+            "targeted_industries": a.get("targeted_industries") or [],
+            "epss": ((a.get("epss") or {}).get("score")), "summary": first_line[:300]}
 
 
 # --- CrowdStrike Falcon Intelligence --------------------------------------------------
@@ -232,6 +267,53 @@ def main():
     for c in caches.values():
         c.save()
 
+    # GTI vulnerability intelligence for every KEV CVE seen on these hosts
+    # (one call per CVE, cached a week; the host count does not matter).
+    if "gti" in available:
+        cves = sorted({c for ip in ips for c in ((ver["results"][ip].get("risk") or {}).get("kev_due_dates") or {})}
+                      | {c for ip in ips for c in ((ver["results"][ip].get("currency") or {}).get("kev_still_listed") or [])})
+        vcache = Cache(os.path.join(OUT_DIR, "gti_vuln_cache.json"), ttl_days=7)
+        vulns = ver.setdefault("vulnerabilities", {})
+        fetched = 0
+        for cve in cves:
+            hit = vcache.get(cve)
+            if not hit:
+                try:
+                    hit = gti_vuln(cve, keys["gti"])
+                    fetched += 1
+                except Exception as exc:
+                    hit = {"ok": False, "error": str(exc)[:120]}
+                vcache.put(cve, hit)
+                time.sleep(args.sleep)
+            vulns[cve] = hit
+        vcache.save()
+        log(f"gti vulnerabilities: {len(cves)} KEV CVEs, {fetched} fetched, "
+            f"{sum(1 for c in cves if vulns[c].get('found'))} with GTI records")
+        rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        for ip in ips:
+            r = ver["results"][ip]
+            mine = sorted({c for c in (r.get("risk") or {}).get("kev_due_dates") or {}}
+                          | set((r.get("currency") or {}).get("kev_still_listed") or []))
+            recs = [(c, vulns.get(c) or {}) for c in mine if (vulns.get(c) or {}).get("found")]
+            if not recs:
+                continue
+            def key_fn(cr):
+                c, v = cr
+                return (rank.get((v.get("risk_rating") or "").upper(), 0), 1 if v.get("priority") == "P0" else 0,
+                        1 if v.get("exploit_availability") == "Publicly Available" else 0, c)
+            worst_cve, worst = max(recs, key=key_fn)
+            r.setdefault("risk", {})["gti_vulns"] = {
+                "cve": worst_cve, "risk_rating": worst.get("risk_rating"), "priority": worst.get("priority"),
+                "exploitation_state": worst.get("exploitation_state"),
+                "exploit_availability": worst.get("exploit_availability"),
+                "consequence": worst.get("exploitation_consequence"), "ransomware_use": worst.get("ransomware_use"),
+                "first_exploitation": worst.get("first_exploitation"),
+                "p0": sum(1 for _, v in recs if v.get("priority") == "P0"),
+                "high_or_critical": sum(1 for _, v in recs if rank.get((v.get("risk_rating") or "").upper(), 0) >= 3),
+                "public_exploit": sum(1 for _, v in recs if v.get("exploit_availability") == "Publicly Available"),
+                "actors": sorted({a for _, v in recs for a in v.get("actors") or []})[:6],
+                "rated": len(recs)}
+
     # Roll-up flags per IP for the report.
     for ip in ips:
         lic = ver["results"][ip].get("licensed") or {}
@@ -241,6 +323,13 @@ def main():
             flags.append(f"GTI/VT: {g['malicious']} engines malicious")
         if g.get("ok") and g.get("gti_assessment") in ("MALICIOUS", "SUSPICIOUS"):
             flags.append(f"GTI verdict {g['gti_assessment']}")
+        ts, tsd = g.get("threat_severity"), g.get("threat_severity_data") or {}
+        if g.get("ok") and ts and ts != "SEVERITY_NONE":
+            flags.append(f"GTI threat severity {ts.replace('SEVERITY_', '')}")
+        if g.get("ok") and tsd.get("belongs_to_threat_actor"):
+            flags.append("GTI: tied to a tracked threat actor")
+        elif g.get("ok") and tsd.get("belongs_to_bad_collection"):
+            flags.append("GTI: in a malicious collection")
         # Communicating files: only samples that engines actually call malicious
         # count (benign tools also phone home to public servers).
         bad = [x for x in (g.get("communicating_sample") or []) if (x.get("malicious") or 0) >= 5]

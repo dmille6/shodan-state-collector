@@ -237,7 +237,8 @@ def write_pdf_tsec(path, sections, totals, meta, verify, marking, per_tier, resi
                    "<b>Licensed intelligence</b> (GTI/VirusTotal, CrowdStrike, AbuseIPDB, OTX) was run only against "
                    "these hosts. A malware sample that <i>communicated with</i> a host means the sample reached out "
                    "to that address when detonated — infrastructure or a legitimate public server it contacted; "
-                   "an analyst decides.<br/><br/>"
+                   "an analyst decides. <b>GTI</b> on a CVE is Google/Mandiant vulnerability intelligence: risk rating, "
+                   "priority, exploit availability and the consequence of exploitation for the worst KEV CVE on the host.<br/><br/>"
                    "Honeypots are excluded. Residential subscribers are reported to ISPs in aggregate, never by IP.", body)],
     ]
     t = Table([cols3], colWidths=[W / 3] * 3)
@@ -359,6 +360,21 @@ def _evidence_html(r, v):
         parts.append(f'<font color="{C["muted"]}">{r["db_ports"]} database service{"s" if r["db_ports"] > 1 else ""}</font>')
     if v and v["risk"].get("ransomware_kev"):
         parts.append(f'<font color="{C["red"]}"><b>ransomware-linked: {e(" ".join(v["risk"]["ransomware_kev"][:2]))}</b></font>')
+    gv = (v or {}).get("risk", {}).get("gti_vulns")
+    if gv:
+        colr = C["red"] if gv.get("risk_rating") in ("HIGH", "CRITICAL") or gv.get("priority") == "P0" else C["amber"]
+        bits = [f'GTI {gv.get("risk_rating") or "?"}']
+        if gv.get("priority"):
+            bits.append(gv["priority"])
+        if gv.get("exploit_availability"):
+            bits.append(gv["exploit_availability"].lower())
+        if gv.get("consequence"):
+            bits.append(gv["consequence"].lower())
+        parts.append(f'<font color="{colr}"><b>{e(" · ".join(bits))}</b></font>'
+                     f'<font color="{C["dim"]}"> ({e(gv["cve"])}'
+                     f'{", " + str(gv["rated"]) + " KEV rated" if gv.get("rated", 0) > 1 else ""})</font>')
+        if gv.get("actors"):
+            parts.append(f'<font color="{C["pink"]}">actors: {e(", ".join(gv["actors"][:3]))}</font>')
     for f in (v or {}).get("licensed_flags") or []:
         parts.append(f'<font color="{C["pink"]}"><b>{e(f)}</b></font>')
     kevs = (r.get("kev_list") or "").split()
