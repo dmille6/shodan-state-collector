@@ -55,3 +55,5 @@ reference/rosters/*
 reference/rosters/manual/cache/
 # notification packets (FOUO)
 reports/packets/
+!reference/fonts/
+!reference/fonts/*.ttf
