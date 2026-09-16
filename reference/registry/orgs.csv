@@ -1,0 +1,93 @@
+org_id,name,sector,jurisdiction,aliases,domains,contact_route,notes,source,as_of
+la-ots,Louisiana Office of Technology Services,government,state,OTS;State of Louisiana Office of Technology Services;State of Louisiana;Division of Administration,la.gov;state.la.us;louisiana.gov;doa.la.gov,OTS/ESF-17,Shared state network and la.gov namespace; agency attribution needs the OTS CIDR drop-in,curated,2026-09-15
+la-dotd,Louisiana Department of Transportation and Development,government|critical_infrastructure,state,DOTD;LA DOTD;Louisiana DOTD,dotd.la.gov;511la.org,OTS/ESF-17,Roads bridges ferries ITS,curated,2026-09-15
+la-ldh,Louisiana Department of Health,government|healthcare,state,LDH;Louisiana Dept of Health;DHH;Department of Health and Hospitals,ldh.la.gov;dhh.la.gov,OTS/ESF-17,Formerly DHH,curated,2026-09-15
+la-ldr,Louisiana Department of Revenue,government,state,LDR;Louisiana Dept of Revenue,revenue.louisiana.gov,OTS/ESF-17,,curated,2026-09-15
+la-lsp,Louisiana State Police,government,state,LSP;Louisiana State Police;Department of Public Safety;DPS,lsp.org;dps.louisiana.gov,OTS/ESF-17,Includes LA Fusion Center,curated,2026-09-15
+la-lasc,Louisiana Supreme Court,government,state,LASC;State of Louisiana Supreme Court;State of Louisiana Supreme Court - JA/CMIS;Judicial Administrator,lasc.org,OTS/ESF-17,Judicial branch runs its own network (JA/CMIS),curated,2026-09-15
+la-legis,Louisiana Legislature,government,state,Louisiana State Legislature;Louisiana House of Representatives;Louisiana Senate;Legislative Fiscal Office,legis.la.gov;house.louisiana.gov;senate.la.gov,OTS/ESF-17,Legislative branch,curated,2026-09-15
+la-sos,Louisiana Secretary of State,government,state,SOS;Secretary of State;Louisiana Dept of State,sos.la.gov;sos.louisiana.gov;geauxvote.com,OTS/ESF-17,Elections and corporations,curated,2026-09-15
+la-regents,Louisiana Board of Regents / LONI,education|government,state,Board of Regents;LONI;Louisiana Optical Network Initiative;Louisiana Optical Network Infrastructure;Louisiana Board of Regents/Louisiana Optical Network Initiative (LONI),regents.la.gov;loni.org,OTS/ESF-17,LONI is the statewide research network; hosts several universities and PBRC,curated,2026-09-15
+la-ebr,East Baton Rouge Parish / City of Baton Rouge,government,parish,City of Baton Rouge;City-Parish;EBR;East Baton Rouge Parish;City of Baton Rouge/Parish of East Baton Rouge,brla.gov;brgov.com,MS-ISAC,Consolidated city-parish,curated,2026-09-15
+la-ebrso,East Baton Rouge Parish Sheriff's Office,government,parish,EBRSO;East Baton Rouge Sheriff,ebrso.org,MS-ISAC,,curated,2026-09-15
+la-jefferson,Jefferson Parish Government,government,parish,Jefferson Parish;Parish of Jefferson;Jefferson Parish Council,jeffparish.net;jeffparish.gov,MS-ISAC,,curated,2026-09-15
+la-jpso,Jefferson Parish Sheriff's Office,government,parish,JPSO;Jefferson Parish Sheriff,jpso.com,MS-ISAC,,curated,2026-09-15
+la-nola,City of New Orleans,government,municipal,City of New Orleans;Orleans Parish;NOLA;New Orleans,nola.gov,MS-ISAC,Consolidated with Orleans Parish,curated,2026-09-15
+la-opso,Orleans Parish Sheriff's Office,government,parish,OPSO;Orleans Parish Sheriff;Orleans Parish Criminal Sheriff,opcso.org,MS-ISAC,,curated,2026-09-15
+la-caddo,Caddo Parish Commission,government,parish,Caddo Parish;Parish of Caddo,caddo.gov,MS-ISAC,,curated,2026-09-15
+la-shreveport,City of Shreveport,government,municipal,City of Shreveport;Shreveport,shreveportla.gov,MS-ISAC,,curated,2026-09-15
+la-lafayette,Lafayette Consolidated Government,government,parish,LCG;Lafayette Consolidated Government;City of Lafayette;Lafayette Parish;Lafayette City-Parish,lafayettela.gov,MS-ISAC,Consolidated city-parish; LUS is a department (see la-lus),curated,2026-09-15
+la-sttammany,St. Tammany Parish Government,government,parish,St. Tammany Parish;St Tammany Parish;Parish of St. Tammany,stpgov.org,MS-ISAC,,curated,2026-09-15
+la-stpso,St. Tammany Parish Sheriff's Office,government,parish,STPSO;St. Tammany Parish Sheriff;St Tammany Sheriff,stpso.com,MS-ISAC,,curated,2026-09-15
+la-calcasieu,Calcasieu Parish Police Jury,government,parish,Calcasieu Parish;Calcasieu Parish Police Jury;CPPJ,calcasieuparish.gov;cppj.net,MS-ISAC,,curated,2026-09-15
+la-lakecharles,City of Lake Charles,government,municipal,City of Lake Charles;Lake Charles,cityoflakecharles.com,MS-ISAC,,curated,2026-09-15
+la-bossier,Bossier Parish Police Jury,government,parish,Bossier Parish;Bossier Parish Police Jury,bossierparishla.gov,MS-ISAC,,curated,2026-09-15
+la-bossiercity,City of Bossier City,government,municipal,Bossier City;City of Bossier City,bossiercity.org,MS-ISAC,,curated,2026-09-15
+la-ouachita,Ouachita Parish Police Jury,government,parish,Ouachita Parish;Ouachita Parish Police Jury;OPPJ,oppj.org,MS-ISAC,,curated,2026-09-15
+la-monroe,City of Monroe,government,municipal,City of Monroe;Monroe Louisiana,monroela.us,MS-ISAC,,curated,2026-09-15
+la-lsu,Louisiana State University,education,state,LSU;LSU A&M;Louisiana State University and Agricultural and Mechanical College;LSU AgCenter,lsu.edu;lsuagcenter.com,direct,Flagship; AS2055,curated,2026-09-15
+la-lsuhsc,LSU Health Sciences Center,education|healthcare,state,LSUHSC;LSU Health;LSU Health New Orleans;LSU Health Shreveport;Louisiana State University Health Sciences Center;LSU Health Sciences Center;LSU Health Sciences Center - Shreveport;LSU Medical,lsuhsc.edu;lsuhs.edu,direct,New Orleans and Shreveport campuses,curated,2026-09-15
+la-lsus,LSU Shreveport,education,state,LSUS;Louisiana State University Shreveport,lsus.edu,direct,,curated,2026-09-15
+la-lsua,LSU Alexandria,education,state,LSUA;Louisiana State University Alexandria;Louisiana State University at Alexandria,lsua.edu,direct,,curated,2026-09-15
+la-lsue,LSU Eunice,education,state,LSUE;Louisiana State University Eunice,lsue.edu,direct,,curated,2026-09-15
+la-pbrc,Pennington Biomedical Research Center,education|healthcare,state,PBRC;Pennington Biomedical,pbrc.edu,direct,LSU System; often on LONI space,curated,2026-09-15
+la-tulane,Tulane University,education,private,Tulane;Tulane University,tulane.edu,direct,AS10349; 129.81.0.0/16,curated,2026-09-15
+la-loyno,Loyola University New Orleans,education,private,Loyola;Loyola University New Orleans;Loyola New Orleans,loyno.edu,direct,,curated,2026-09-15
+la-latech,Louisiana Tech University,education,state,Louisiana Tech;LA Tech;Louisiana Tech University,latech.edu,direct,,curated,2026-09-15
+la-ulm,University of Louisiana Monroe,education,state,ULM;University of Louisiana at Monroe;Northeast Louisiana University,ulm.edu,direct,ARIN record still says Northeast Louisiana University,curated,2026-09-15
+la-ull,University of Louisiana at Lafayette,education,state,ULL;UL Lafayette;University of Louisiana at Lafayette;University of Southwestern Louisiana,louisiana.edu,direct,,curated,2026-09-15
+la-subr,Southern University and A&M College,education,state,Southern University;SUBR;Southern University System;SUS,subr.edu;sus.edu,direct,Baton Rouge; system office,curated,2026-09-15
+la-nsula,Northwestern State University,education,state,NSU;Northwestern State University;Northwestern State University of Louisiana,nsula.edu,direct,Natchitoches,curated,2026-09-15
+la-mcneese,McNeese State University,education,state,McNeese;McNeese State University,mcneese.edu,direct,Lake Charles,curated,2026-09-15
+la-nicholls,Nicholls State University,education,state,Nicholls;Nicholls State University,nicholls.edu,direct,Thibodaux,curated,2026-09-15
+la-selu,Southeastern Louisiana University,education,state,SELU;Southeastern;Southeastern Louisiana University,selu.edu,direct,Hammond,curated,2026-09-15
+la-uno,University of New Orleans,education,state,UNO;University of New Orleans;University Of New Orleans,uno.edu,direct,,curated,2026-09-15
+la-xula,Xavier University of Louisiana,education,private,Xavier;Xavier University of Louisiana,xula.edu,direct,,curated,2026-09-15
+la-dillard,Dillard University,education,private,Dillard;Dillard University,dillard.edu,direct,,curated,2026-09-15
+la-centenary,Centenary College of Louisiana,education,private,Centenary;Centenary College,centenary.edu,direct,Shreveport,curated,2026-09-15
+la-gram,Grambling State University,education,state,Grambling;Grambling State University,gram.edu,direct,,curated,2026-09-15
+la-lctcs,Louisiana Community and Technical College System,education,state,LCTCS;Louisiana Community and Technical College System,lctcs.edu,direct,System office,curated,2026-09-15
+la-bpcc,Bossier Parish Community College,education,state,BPCC;Bossier Parish Community College,bpcc.edu,direct,LCTCS,curated,2026-09-15
+la-delgado,Delgado Community College,education,state,Delgado;Delgado Community College,dcc.edu,direct,LCTCS,curated,2026-09-15
+la-rpcc,River Parishes Community College,education,state,RPCC;River Parishes Community College,rpcc.edu,direct,LCTCS,curated,2026-09-15
+la-sowela,SOWELA Technical Community College,education,state,SOWELA;Sowela Technical Community College,sowela.edu,direct,LCTCS,curated,2026-09-15
+la-fletcher,Fletcher Technical Community College,education,state,Fletcher;Fletcher Technical Community College,fletcher.edu,direct,LCTCS,curated,2026-09-15
+la-nunez,Nunez Community College,education,state,Nunez;Nunez Community College,nunez.edu,direct,LCTCS,curated,2026-09-15
+la-cltcc,Central Louisiana Technical Community College,education,state,CLTCC;Central Louisiana Technical Community College,cltcc.edu,direct,LCTCS,curated,2026-09-15
+la-ntcc,Northshore Technical Community College,education,state,NTCC;Northshore Technical Community College,northshorecollege.edu,direct,LCTCS,curated,2026-09-15
+la-suno,Southern University at New Orleans,education,state,SUNO;Southern University at New Orleans,suno.edu,direct,Southern University System,curated,2026-09-15
+la-lcu,Louisiana Christian University,education,private,LCU;Louisiana Christian University;Louisiana College,lcu.edu,direct,Pineville; formerly Louisiana College,curated,2026-09-15
+la-franu,Franciscan Missionaries of Our Lady University,education|healthcare,private,FranU;Franciscan Missionaries of Our Lady University;Our Lady of the Lake College,franu.edu,direct,FMOLHS-affiliated,curated,2026-09-15
+la-ochsner,Ochsner Health,healthcare,private,Ochsner;Ochsner Health System;Ochsner Clinic Foundation;Ochsner Medical Center,ochsner.org,Health-ISAC,Largest LA health system; AS63103,curated,2026-09-15
+la-lcmc,LCMC Health,healthcare,private,LCMC;LCMC Health;Louisiana Children's Medical Center;Children's Hospital New Orleans;University Medical Center New Orleans;Touro Infirmary;Touro Infirmary Hospital;East Jefferson General Hospital;West Jefferson Medical Center,lcmchealth.org;chnola.org;umcno.org;touro.com;ejgh.org;wjmc.org,Health-ISAC,New Orleans system,curated,2026-09-15
+la-fmolhs,Franciscan Missionaries of Our Lady Health System,healthcare,private,FMOLHS;FMOL Health;Our Lady of the Lake;OLOL;Our Lady of the Lake Regional Medical Center;Our Lady of the Lake Hospital;Our Lady of Lourdes;Our Lady of the Angels;St. Francis Medical Center,fmolhs.org;ololrmc.com;lourdesrmc.com;stfran.com,Health-ISAC,Baton Rouge; Lafayette; Monroe; Bogalusa,curated,2026-09-15
+la-wkhs,Willis-Knighton Health System,healthcare,private,Willis-Knighton;Willis Knighton;WK Health;Willis-Knighton Medical Center,wkhs.com,Health-ISAC,Shreveport,curated,2026-09-15
+la-lgh,Ochsner Lafayette General,healthcare,private,Lafayette General;Lafayette General Health;Lafayette General Medical Center;Ochsner Lafayette General,lafayettegeneral.com,Health-ISAC,Joined Ochsner in 2020; retains own domain,curated,2026-09-15
+la-tulanemed,Tulane Medical Center / Tulane Health System,healthcare,private,Tulane Medical Center;Tulane Health System;Tulane Doctors,tulanehealthcare.com,Health-ISAC,Tulane University hospital operations (now LCMC-operated); distinct from tulane.edu,curated,2026-09-15
+la-northoaks,North Oaks Health System,healthcare,parish,North Oaks;North Oaks Health System;North Oaks Medical Center,northoaks.org,Health-ISAC,Hammond; Tangipahoa Parish Hospital Service District,curated,2026-09-15
+la-acadian,Acadian Ambulance Service,healthcare|critical_infrastructure,private,Acadian Ambulance;Acadian Companies;Acadian Ambulance Service Inc,acadian.com,Health-ISAC,Lafayette; EMS; AS40346,curated,2026-09-15
+la-entergy,Entergy,energy,private,Entergy;Entergy Louisiana;Entergy New Orleans;Entergy Corporation;Entergy Services,entergy.com,direct,Electric utility; New Orleans HQ; also AR MS TX,curated,2026-09-15
+la-cleco,Cleco,energy,private,Cleco;Cleco Power;Cleco Corporate Holdings;Central Louisiana Electric,cleco.com,direct,Pineville,curated,2026-09-15
+la-swepco,Southwestern Electric Power Company,energy,private,SWEPCO;Southwestern Electric Power;AEP SWEPCO;American Electric Power,swepco.com,direct,AEP subsidiary serving Shreveport area,curated,2026-09-15
+la-lus,Lafayette Utilities System,energy|water|telecom,municipal,LUS;Lafayette Utilities System,lus.org;lusfiber.com,MS-ISAC,Department of Lafayette Consolidated Government. LUS Fiber (the ISP; ASN registrant 'LUS Fiber') is deliberately NOT an alias and lusfiber.net not a domain: that space holds subscribers,curated,2026-09-15
+la-swbno,Sewerage and Water Board of New Orleans,water,municipal,SWBNO;Sewerage & Water Board;Sewerage and Water Board of New Orleans;S&WB,swbno.org,MS-ISAC,,curated,2026-09-15
+la-brwc,Baton Rouge Water Company,water,private,Baton Rouge Water Company;Baton Rouge Water;Parish Water Company,brwater.com,direct,Investor-owned,curated,2026-09-15
+la-exxon-br,ExxonMobil Baton Rouge,energy|critical_infrastructure,private,ExxonMobil;Exxon Mobil;ExxonMobil Baton Rouge Refinery;Exxon Mobil Corporation,exxonmobil.com,direct,Baton Rouge refinery and chemical plant,curated,2026-09-15
+la-shell-norco,Shell Norco / Convent,energy|critical_infrastructure,private,Shell;Shell Oil;Shell Chemical;Shell Norco;Shell Convent,shell.com;shell.us,direct,Norco manufacturing complex; Convent refinery (idled 2020),curated,2026-09-15
+la-marathon-garyville,Marathon Petroleum Garyville,energy|critical_infrastructure,private,Marathon;Marathon Petroleum;Marathon Garyville;Marathon Petroleum Corporation,marathonpetroleum.com,direct,Garyville refinery,curated,2026-09-15
+la-valero,Valero St. Charles / Meraux,energy|critical_infrastructure,private,Valero;Valero Energy;Valero St. Charles;Valero Meraux,valero.com,direct,St. Charles (Norco) and Meraux refineries,curated,2026-09-15
+la-citgo,CITGO Lake Charles,energy|critical_infrastructure,private,CITGO;Citgo Petroleum;CITGO Lake Charles,citgo.com,direct,Lake Charles refinery,curated,2026-09-15
+la-p66,Phillips 66 Alliance / Lake Charles,energy|critical_infrastructure,private,Phillips 66;Phillips 66 Company;Phillips 66 Alliance;Phillips 66 Lake Charles;Phillips 66 Westlake,phillips66.com,direct,Alliance (Belle Chasse; converted to terminal) and Lake Charles refineries,curated,2026-09-15
+la-placid,Placid Refining Company,energy|critical_infrastructure,private,Placid Refining;Placid,placidrefining.com,direct,Port Allen refinery,curated,2026-09-15
+la-dow,Dow Louisiana Operations,critical_infrastructure,private,Dow;Dow Chemical;Dow Louisiana;Dow Plaquemine,dow.com,direct,Plaquemine complex,curated,2026-09-15
+la-basf,BASF Geismar,critical_infrastructure,private,BASF;BASF Corporation;BASF Geismar,basf.com,direct,Geismar site,curated,2026-09-15
+la-sasol,Sasol Lake Charles,critical_infrastructure,private,Sasol;Sasol Chemicals;Sasol North America;Sasol Lake Charles,sasol.com,direct,Lake Charles chemical complex (Westlake),curated,2026-09-15
+la-cheniere,Cheniere Energy / Sabine Pass LNG,energy|critical_infrastructure,private,Cheniere;Cheniere Energy;Sabine Pass LNG;Sabine Pass Liquefaction,cheniere.com,direct,Sabine Pass export terminal (Cameron Parish),curated,2026-09-15
+la-venture-global,Venture Global LNG,energy|critical_infrastructure,private,Venture Global;Venture Global LNG;Calcasieu Pass;Plaquemines LNG,venturegloballng.com,direct,Calcasieu Pass and Plaquemines LNG,curated,2026-09-15
+la-portnola,Port of New Orleans,critical_infrastructure,state,Port NOLA;Port of New Orleans;Board of Commissioners of the Port of New Orleans,portnola.com,MS-ISAC,State political subdivision,curated,2026-09-15
+la-portsl,Port of South Louisiana,critical_infrastructure,state,Port of South Louisiana,portsl.com,MS-ISAC,LaPlace,curated,2026-09-15
+la-portgbr,Port of Greater Baton Rouge,critical_infrastructure,state,Port of Greater Baton Rouge;Greater Baton Rouge Port Commission,portgbr.com,MS-ISAC,Port Allen,curated,2026-09-15
+la-msy,Louis Armstrong New Orleans International Airport,critical_infrastructure,municipal,MSY;New Orleans Airport;Louis Armstrong International;New Orleans Aviation Board,flymsy.com,MS-ISAC,Owned by City of New Orleans; Kenner,curated,2026-09-15
+la-btr,Baton Rouge Metropolitan Airport,critical_infrastructure,municipal,BTR;Baton Rouge Metropolitan Airport;Ryan Field,flybtr.com,MS-ISAC,City-Parish owned,curated,2026-09-15
+la-shv,Shreveport Regional Airport,critical_infrastructure,municipal,SHV;Shreveport Regional Airport;Shreveport Airport Authority,flyshreveport.com,MS-ISAC,,curated,2026-09-15
+la-lft,Lafayette Regional Airport,critical_infrastructure,parish,LFT;Lafayette Regional Airport;Lafayette Airport Commission,lftairport.com,MS-ISAC,,curated,2026-09-15

@@ -36,11 +36,18 @@ geoip*.tar.gz
 status/
 .pipeline.lock
 
-# Phase 2 — generated / cached / sensitive
-reference/registry/*_cache.json        # Team Cymru + ARIN RDAP lookup caches
-reference/rosters/*.csv                # generated from public sources (refresh_rosters.py)
-!reference/rosters/manual/             # hand-maintained drop-ins are versioned
-reference/rosters/cache/
-reference/discovery/                   # CT discovery output names Louisiana hosts (FOUO)
-reference/shadowserver/                # Shadowserver reports (FOUO)
+# Phase 2 — the CURATED registry inputs are versioned (they are the product);
+# everything generated, cached or sensitive under reference/ stays ignored.
+!reference/
+reference/*                            # ignore everything under reference/ ...
+!reference/registry/                   # ... except the registry inputs
+reference/registry/*
+!reference/registry/orgs.csv
+!reference/registry/networks.csv
+!reference/registry/domains.csv
+!reference/registry/ots_cidrs.csv.example
+!reference/rosters/
+reference/rosters/*
+!reference/rosters/manual/             # hand-maintained drop-ins
+reference/rosters/manual/cache/
 reports/packets/                       # notification packets (FOUO)

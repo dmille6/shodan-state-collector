@@ -1,0 +1,20 @@
+prefix,asn,org_id,source,confidence,as_of
+130.39.0.0/16,AS2055,la-lsu,curated (ARIN NET-130-39-0-0-1 LSU-IPV4),high,2026-09-15
+129.81.0.0/16,AS10349,la-tulane,curated (ARIN NET-129-81-0-0-1 TULANE-NET),high,2026-09-15
+,AS2055,la-lsu,curated (ARIN AS2055 LSU),medium,2026-09-15
+,AS10349,la-tulane,curated (ARIN AS10349 TULANE),medium,2026-09-15
+,AS32440,la-regents,curated (ARIN AS32440 LONI; hosts several universities and PBRC),medium,2026-09-15
+,AS2048,la-ots,curated (ARIN AS2048 LANET-1 State of Louisiana OTS),medium,2026-09-15
+,AS63103,la-ochsner,curated (ARIN AS63103 OCF-AS Ochsner Clinic Foundation),medium,2026-09-15
+,AS23366,la-lsuhsc,curated (ARIN AS23366 LSU Health Sciences Center),medium,2026-09-15
+,AS16913,la-loyno,curated (ARIN AS16913 LOYNO-EDU),medium,2026-09-15
+,AS19564,la-latech,curated (ARIN AS19564 LATECH),medium,2026-09-15
+,AS22985,la-ull,curated (ARIN AS22985 UL-LAFAYETTE-1),medium,2026-09-15
+,AS23294,la-ulm,curated (ARIN AS23294 ULM-1),medium,2026-09-15
+,AS26002,la-subr,curated (ARIN AS26002 SU-NOC Southern University),medium,2026-09-15
+,AS23207,la-nsula,curated (ARIN AS23207 NORTHWESTERN-STATE),medium,2026-09-15
+,AS26333,la-uno,curated (ARIN AS26333 UNONET),medium,2026-09-15
+,AS25968,la-selu,curated (ARIN AS25968 SELUNET),medium,2026-09-15
+,AS40863,la-bossier,curated (ARIN AS40863 COURTHOUSE Bossier Parish Police Jury),medium,2026-09-15
+,AS36402,la-northoaks,curated (ARIN AS36402 NORTH-OAKS-HEALTH-SYSTEM),medium,2026-09-15
+,AS40346,la-acadian,curated (ARIN AS40346 ACADIAN-AMBULANCE-SERVICE),medium,2026-09-15
