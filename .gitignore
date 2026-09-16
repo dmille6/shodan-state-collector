@@ -39,8 +39,10 @@ status/
 # Phase 2 — the CURATED registry inputs are versioned (they are the product);
 # everything generated, cached or sensitive under reference/ stays ignored.
 !reference/
-reference/*                            # ignore everything under reference/ ...
-!reference/registry/                   # ... except the registry inputs
+# ignore everything under reference/ ...
+reference/*
+# ... except the registry inputs
+!reference/registry/
 reference/registry/*
 !reference/registry/orgs.csv
 !reference/registry/networks.csv
@@ -48,6 +50,8 @@ reference/registry/*
 !reference/registry/ots_cidrs.csv.example
 !reference/rosters/
 reference/rosters/*
-!reference/rosters/manual/             # hand-maintained drop-ins
+# hand-maintained drop-ins
+!reference/rosters/manual/
 reference/rosters/manual/cache/
-reports/packets/                       # notification packets (FOUO)
+# notification packets (FOUO)
+reports/packets/
