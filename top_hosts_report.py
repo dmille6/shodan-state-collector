@@ -137,11 +137,74 @@ def first_n(csv_text, n):
     return ", ".join(sorted({x for x in (csv_text or "").split(",") if x})[:n])
 
 
-def write_csv(path, sections):
+def latest_verify(out_dir):
+    import glob
+    files = sorted(glob.glob(os.path.join(SCRIPT_DIR, "reference", "verification", "verify_*.json")))
+    return files[-1] if files else None
+
+
+def load_verify(path):
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        return json.load(open(path)).get("results") or {}
+    except Exception:
+        return {}
+
+
+def verify_words(v):
+    """One compact paragraph of verification facts for a host, or ''."""
+    if not v:
+        return ""
+    la, cur, own, risk = v["louisiana"], v["currency"], v["owner"], v["risk"]
+    bits = [f"Louisiana: {la['confidence']} ({', '.join(la['votes_for']) or 'no independent vote'})"]
+    if la.get("rdns_city") or la.get("netblock_city_code"):
+        bits.append(f"metro {la.get('rdns_city') or la.get('netblock_city_code')}")
+    if la.get("netblock_state") and la["netblock_state"] != "LA":
+        bits.append(f"netblock registered in {la['netblock_state']}")
+    if cur.get("shodan_last_update"):
+        bits.append(f"Shodan last scanned {str(cur['shodan_last_update'])[:10]}")
+    if cur.get("kev_still_listed") is not None:
+        n_still = len(cur["kev_still_listed"] or []); n_gone = len(cur["kev_no_longer_listed"] or [])
+        bits.append(f"KEV still listed today {n_still}/{n_still + n_gone}" if (n_still + n_gone) else "no KEV on current record")
+    if cur.get("dwell_days") is not None:
+        bits.append(f"visible {cur['dwell_days']}d")
+    if risk.get("ransomware_kev"):
+        bits.append(f"RANSOMWARE-LINKED KEV: {', '.join(risk['ransomware_kev'][:3])}")
+    if risk.get("cert_expired"):
+        bits.append("cert expired")
+    for f in v.get("licensed_flags") or []:
+        bits.append(f)
+    return "; ".join(bits)
+
+
+def owner_verify_words(v):
+    if not v:
+        return ""
+    own = v["owner"]
+    bits = []
+    if own.get("registrant"):
+        bits.append(f"netblock: {own['registrant']}" + (f" ({own['netblock']})" if own.get("netblock") else ""))
+    if own.get("abuse_contacts"):
+        bits.append("abuse: " + ", ".join(own["abuse_contacts"][:2]))
+    names = own.get("current_hostnames") or []
+    pdns = own.get("passive_dns") or []
+    if names:
+        bits.append("now: " + ", ".join(names[:2]))
+    if pdns:
+        bits.append("pDNS: " + ", ".join(pdns[:2]))
+    return "; ".join(bits)
+
+
+def write_csv(path, sections, verify=None):
     cols = ["tier", "rank", "ip", "shodan_url", "owner", "attr_confidence", "attr_method", "shodan_org", "city",
             "asn", "score", "kev_verified", "kev_exploit", "kev", "cves", "max_cvss", "max_epss", "ics",
             "appliances", "ioc", "admin_ports", "db_ports", "services", "ports", "products", "hostnames",
-            "cert_orgs", "kev_list", "last_seen"]
+            "cert_orgs", "kev_list", "last_seen",
+            "la_confidence", "la_votes", "metro", "netblock", "netblock_registrant", "netblock_state",
+            "abuse_contacts", "technical_contacts", "current_hostnames", "shodan_last_update",
+            "kev_still_listed", "kev_no_longer_listed", "current_ports", "dwell_days", "ransomware_kev",
+            "kev_due_dates", "cert_expires", "cert_expired", "licensed_flags", "passive_dns"]
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(cols)
@@ -154,10 +217,26 @@ def write_csv(path, sections):
                             r["admin_ports"], r["db_ports"], r["services"],
                             " ".join(str(p) for p in (r["ports"] or [])), first_n(r.get("products"), 6),
                             first_n(r.get("hostnames"), 6), first_n(r.get("cert_orgs"), 3), r.get("kev_list"),
-                            r["last_seen"]])
+                            r["last_seen"]] + verify_cols((verify or {}).get(r["ip"])))
 
 
-def write_pdf(path, sections, totals, meta, marking, per_tier, residential_excluded, n_scored):
+def verify_cols(v):
+    if not v:
+        return [""] * 21
+    la, cur, own, risk = v["louisiana"], v["currency"], v["owner"], v["risk"]
+    return [la["confidence"], " ".join(la["votes_for"]), la.get("rdns_city") or la.get("netblock_city_code") or "",
+            own.get("netblock") or "", own.get("registrant") or "", la.get("netblock_state") or "",
+            " ".join(own.get("abuse_contacts") or []), " ".join(own.get("technical_contacts") or []),
+            " ".join(own.get("current_hostnames") or []), cur.get("shodan_last_update") or "",
+            " ".join(cur.get("kev_still_listed") or []), " ".join(cur.get("kev_no_longer_listed") or []),
+            " ".join(str(p) for p in (cur.get("current_ports") or [])), cur.get("dwell_days"),
+            " ".join(risk.get("ransomware_kev") or []),
+            " ".join(f"{k}:{d}" for k, d in (risk.get("kev_due_dates") or {}).items()),
+            risk.get("cert_expires") or "", risk.get("cert_expired"),
+            " | ".join(v.get("licensed_flags") or []), " ".join(own.get("passive_dns") or [])]
+
+
+def write_pdf(path, sections, totals, meta, marking, per_tier, residential_excluded, n_scored, verify=None):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_LEFT
     from reportlab.lib.pagesizes import landscape, letter
@@ -227,9 +306,30 @@ def write_pdf(path, sections, totals, meta, marking, per_tier, residential_exclu
                            "behind the IP is unattributed — attribution work comes before any notification. CVSS is the "
                            "highest on the host; EPSS is the probability of exploitation within 30 days. Only hosts seen "
                            "in the last 14 days count as current.", body))
+    if verify:
+        n_v = len(verify)
+        conf = {}
+        for v in verify.values():
+            conf[v["louisiana"]["confidence"]] = conf.get(v["louisiana"]["confidence"], 0) + 1
+        still = sum(1 for v in verify.values() if v["currency"].get("kev_still_listed"))
+        rans = sum(1 for v in verify.values() if v["risk"].get("ransomware_kev"))
+        lic = sum(1 for v in verify.values() if v.get("licensed_flags"))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            f"<b>Verification pass ({n_v} hosts).</b> Louisiana location confidence — high {conf.get('high', 0)}, "
+            f"medium {conf.get('medium', 0)}, low {conf.get('low', 0)} — from independent votes: Shodan region, "
+            f"MaxMind, the ARIN netblock registrant address, a carrier metro code in reverse DNS or the netblock "
+            f"name, and the owner registry. <b>Currency:</b> each host was re-queried on Shodan today; {still} "
+            f"still show at least one of their KEV CVEs on Shodan's current record (the Verification column gives "
+            f"the last scan date and the still-listed count). <b>Ransomware:</b> {rans} hosts carry a KEV CVE that "
+            f"CISA marks as used in ransomware campaigns. <b>Owner:</b> the ARIN netblock registrant and its abuse "
+            f"contact are shown under each owner — for carrier space that is the carrier, who relays to the "
+            f"customer. Licensed-intelligence flags (GTI/VirusTotal, CrowdStrike, AbuseIPDB, OTX) are shown for "
+            f"{lic} hosts.", body))
     story.append(PageBreak())
 
-    widths = [0.3 * inch, 1.35 * inch, 1.9 * inch, 0.5 * inch, 2.6 * inch, 0.6 * inch, 1.9 * inch, 0.75 * inch]
+    widths = ([0.3 * inch, 1.3 * inch, 1.85 * inch, 0.5 * inch, 2.2 * inch, 0.6 * inch, 1.5 * inch, 1.65 * inch]
+              if verify else [0.3 * inch, 1.35 * inch, 1.9 * inch, 0.5 * inch, 2.6 * inch, 0.6 * inch, 1.9 * inch, 0.75 * inch])
     for tier, rows in sections.items():
         if not rows:
             continue
@@ -241,7 +341,8 @@ def write_pdf(path, sections, totals, meta, marking, per_tier, residential_exclu
                           f"exploitable KEV CVE · {ics} with ICS exposed · {ioc} on a threat feed", small),
                 Spacer(1, 4)]
         data = [[Paragraph(f"<b>{h}</b>", small) for h in
-                 ("#", "Host", "Owner", "Score", "Evidence", "CVSS / EPSS", "Services", "Last seen")]]
+                 ("#", "Host", "Owner", "Score", "Evidence", "CVSS / EPSS", "Services",
+                  "Verification" if verify else "Last seen")]]
         for i, r in enumerate(rows, 1):
             url = f"https://www.shodan.io/host/{r['ip']}"
             host = (f'<link href="{url}" color="#1F5C46"><b>{html.escape(r["ip"])}</b></link><br/>'
@@ -251,6 +352,10 @@ def write_pdf(path, sections, totals, meta, marking, per_tier, residential_exclu
             names = first_n(r.get("hostnames"), 2)
             certs = first_n(r.get("cert_orgs"), 1)
             owner = html.escape(owner_words(r))
+            v = (verify or {}).get(r["ip"])
+            ov = owner_verify_words(v)
+            if ov:
+                owner += f'<br/><font size="6.6" color="#1F5C46">{html.escape(ov)}</font>'
             if certs:
                 owner += f'<br/><font size="6.6" color="#4A5461">cert: {html.escape(certs)}</font>'
             if names:
@@ -267,10 +372,14 @@ def write_pdf(path, sections, totals, meta, marking, per_tier, residential_exclu
             prods = first_n(r.get("products"), 3)
             if prods:
                 svc += f'<br/><font size="6.6" color="#4A5461">{html.escape(prods)}</font>'
+            last_cell = (Paragraph(f'<font size="6.6">{html.escape(verify_words(v))}</font>', cell)
+                         if verify else Paragraph(str(r["last_seen"]), cell))
+            if verify and v and v["risk"].get("ransomware_kev"):
+                ev += '<br/><font size="6.6" color="#A8352F"><b>ransomware-linked KEV</b></font>'
             data.append([Paragraph(str(i), cell), Paragraph(host, cell), Paragraph(owner, cell),
                          Paragraph(f"<b>{r['score']:.0f}</b>", cell), Paragraph(ev, cell),
                          Paragraph(f"{cv}<br/><font size=\"6.6\" color=\"#4A5461\">EPSS {ep}</font>", cell),
-                         Paragraph(svc, cell), Paragraph(str(r["last_seen"]), cell)])
+                         Paragraph(svc, cell), last_cell])
         t = Table(data, colWidths=widths, repeatRows=1)
         style = [("VALIGN", (0, 0), (-1, -1), "TOP"), ("LINEBELOW", (0, 0), (-1, 0), 0.8, ink),
                  ("LINEBELOW", (0, 1), (-1, -1), 0.3, rule), ("LEFTPADDING", (0, 0), (-1, -1), 4),
@@ -298,6 +407,8 @@ def main():
     ap.add_argument("--tiers", default=",".join(DEFAULT_TIERS))
     ap.add_argument("--include-residential", action="store_true", help="internal use only")
     ap.add_argument("--marking", default="FOUO — DRAFT — LEADS TO VERIFY — NOT FOR ONWARD DISTRIBUTION")
+    ap.add_argument("--verify", nargs="?", const="latest", default=None,
+                    help="add the verification block from verify_hosts.py (path, or 'latest')")
     args = ap.parse_args()
 
     rows, meta = load(args.db)
@@ -309,8 +420,13 @@ def main():
     totals = {t: sum(1 for r in rows if r["tier"] == t) for t in tiers}
     os.makedirs(args.out, exist_ok=True)
     stem = os.path.join(args.out, f"top_hosts_{meta['newest_day']}")
-    write_csv(stem + ".csv", sections)
-    write_pdf(stem + ".pdf", sections, totals, meta, args.marking, args.per_tier, residential_excluded, len(rows))
+    verify = {}
+    if args.verify:
+        vpath = latest_verify(args.out) if args.verify == "latest" else args.verify
+        verify = load_verify(vpath)
+        print(f"verification: {len(verify)} hosts from {vpath}", file=sys.stderr)
+    write_csv(stem + ".csv", sections, verify)
+    write_pdf(stem + ".pdf", sections, totals, meta, args.marking, args.per_tier, residential_excluded, len(rows), verify)
     print(json.dumps({"pdf": stem + ".pdf", "csv": stem + ".csv", "scored": len(rows),
                       "per_tier": {t: len(v) for t, v in sections.items()}, "totals": totals}))
     return 0

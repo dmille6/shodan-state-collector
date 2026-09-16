@@ -31,9 +31,17 @@ EPSS_URLS = ["https://epss.empiricalsecurity.com/epss_scores-current.csv.gz",
 def refresh_kev():
     with urllib.request.urlopen(KEV_URL, timeout=30) as r:
         data = json.load(r)
-    cves = [v["cveID"] for v in data.get("vulnerabilities", [])]
-    json.dump({"count": len(cves), "cves": cves}, open(os.path.join(REF, "kev.json"), "w"))
-    print(f"KEV: {len(cves)} known-exploited CVEs")
+    vulns = data.get("vulnerabilities", [])
+    cves = [v["cveID"] for v in vulns]
+    # Keep the metadata that changes what an analyst does with a KEV hit:
+    # known ransomware-campaign use, the CISA due date, and the product.
+    meta = {v["cveID"]: {"ransomware": (v.get("knownRansomwareCampaignUse") == "Known"),
+                         "dueDate": v.get("dueDate"), "dateAdded": v.get("dateAdded"),
+                         "product": f"{v.get('vendorProject', '')} {v.get('product', '')}".strip()}
+            for v in vulns}
+    write_json_atomic(os.path.join(REF, "kev.json"), {"count": len(cves), "cves": cves, "meta": meta,
+                                                       "as_of": datetime.now().strftime("%Y-%m-%d")})
+    print(f"KEV: {len(cves)} known-exploited CVEs ({sum(1 for m in meta.values() if m['ransomware'])} ransomware-linked)")
 
 
 def refresh_epss():
