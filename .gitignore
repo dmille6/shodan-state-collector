@@ -35,3 +35,12 @@ geoip*.tar.gz
 # Runtime bookkeeping (per-day collector exit codes, pipeline lock)
 status/
 .pipeline.lock
+
+# Phase 2 — generated / cached / sensitive
+reference/registry/*_cache.json        # Team Cymru + ARIN RDAP lookup caches
+reference/rosters/*.csv                # generated from public sources (refresh_rosters.py)
+!reference/rosters/manual/             # hand-maintained drop-ins are versioned
+reference/rosters/cache/
+reference/discovery/                   # CT discovery output names Louisiana hosts (FOUO)
+reference/shadowserver/                # Shadowserver reports (FOUO)
+reports/packets/                       # notification packets (FOUO)

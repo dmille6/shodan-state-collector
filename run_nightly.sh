@@ -86,12 +86,11 @@ if ! record_rc "$TODAY" "$collect_rc"; then
 fi
 
 # Project into the store if a file for today exists (partial counts too).
+store_rc=0
 if ls "$DIR/$OUT_SUBDIR"/*-events-"$TODAY".json.gz >/dev/null 2>&1; then
     "$PY" "$DIR/build_store.py" --date "$TODAY"
-    # Phase 2: refresh the leads table from the updated store (idempotent).
-    if [ -f "$DIR/leads.py" ]; then
-        "$PY" "$DIR/leads.py" refresh || echo "$(ts) - run_nightly: WARNING leads refresh exited $?" >&2
-    fi
+    store_rc=$?
+    [ "$store_rc" -eq 0 ] || echo "$(ts) - run_nightly: WARNING build_store exited $store_rc — store may be stale" >&2
 fi
 
 # Compromise tripwire: ask Shodan for hosts it has FLAGGED as compromised/malicious
@@ -104,6 +103,23 @@ fi
 # compromise_hits/.
 "$PY" "$DIR/compromise_watch.py"
 watch_rc=$?
+
+# Phase 2 evidence: Shadowserver reports (no-op until the state subscribes and
+# keys are in .env), then the leads table — AFTER the store, the tripwire and
+# Shadowserver, so new compromise evidence becomes a lead the same night. Runs
+# even when no census file arrived (external evidence still needs reconciling).
+if [ -f "$DIR/ingest_shadowserver.py" ]; then
+    "$PY" "$DIR/ingest_shadowserver.py" fetch --date "$TODAY" >/dev/null 2>&1 || true
+    "$PY" "$DIR/ingest_shadowserver.py" ingest || echo "$(ts) - run_nightly: WARNING shadowserver ingest exited $?" >&2
+fi
+if [ -f "$DIR/leads.py" ] && [ "$store_rc" -eq 0 ]; then
+    "$PY" "$DIR/leads.py" refresh || echo "$(ts) - run_nightly: WARNING leads refresh exited $?" >&2
+elif [ -f "$DIR/leads.py" ]; then
+    echo "$(ts) - run_nightly: leads refresh skipped (store build failed)" >&2
+fi
+# Sensitive derived data (named orgs, attribution, packets): owner + group only.
+chmod -R o-rwx "$DIR/store" "$DIR/reports" "$DIR/reference/registry" "$DIR/reference/discovery" \
+      "$DIR/reference/shadowserver" "$DIR/compromise_hits" 2>/dev/null || true
 if [ "$watch_rc" -eq 10 ]; then
     echo "$(ts) - run_nightly: COMPROMISE TRIPWIRE FIRED — see the ALERT block above and $DIR/compromise_hits/" >&2
 elif [ "$watch_rc" -eq 5 ]; then

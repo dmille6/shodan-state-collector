@@ -188,6 +188,29 @@ time; `exposure_status` labels each one `active` (seen in the last 14 days),
 right now". A host not seen recently is *unknown*, not remediated: the daily
 query is a delta of re-scanned hosts.
 
+## Phase 2 — owner registry, rosters, discovery, leads
+
+Phase 2 turns "an IP in Louisiana is exposed" into "this named organisation
+owns it, here is the lead, here is who to tell". Everything below is passive
+and runs from `run_weekly.sh` (Sundays 21:30) and the nightly.
+
+| Piece | Script | What it does | Doc |
+|---|---|---|---|
+| Owner registry | `build_registry.py`, `registry.py` | `reference/registry/*.csv` (curated orgs, networks, domains; drop in `ots_cidrs.csv` from OTS) + Team Cymru IP-to-ASN + ARIN RDAP + rDNS/certificate domain matching + sector-roster names → `store/registry/ip_attribution.parquet`, one graded row per IP (method, confidence, evidence). A **high**-confidence attribution sets the host's tier from the org's sector in `build_store.py`. | [docs/REGISTRY.md](docs/REGISTRY.md) |
+| Sector rosters | `refresh_rosters.py` | Authoritative name lists: EPA SDWIS water systems, NPPES healthcare orgs, NCES/IPEDS schools, EIA-860/BSEE energy, Census parishes and municipalities → `reference/rosters/<sector>.csv`; manual drop-ins under `manual/` for sources with no export (LDNR SONRIS). | [docs/ROSTERS.md](docs/ROSTERS.md) |
+| Domain discovery | `discover_domains.py` | Certificate transparency (crt.sh) for `la.gov`, `k12.la.us`, Louisiana `.edu` and registry domains, resolved by DNS (never connecting to hosts) → `reference/discovery/`. Finds sector hosts sitting on carrier space. | [docs/ROSTERS.md](docs/ROSTERS.md) |
+| Exploit index + IOC feeds | `refresh_reference.py` | `reference/exploits.json` (Metasploit, Nuclei → `vulns.has_exploit`), `reference/ioc_ips.json` (Feodo, SSLBL, ThreatFox, URLhaus, CINS, Spamhaus DROP → `ioc_matches` view; matched locally, residential aggregated only). | — |
+| Appliance-first triage | `build_store.py` | `appliance_exposure` view: FortiGate, SonicWall, F5, Citrix, Ivanti, Cisco ASA, Exchange, … on `current_state`. | `queries.sql` §10 |
+| Leads | `leads.py` | Persisted `leads` table with a lifecycle (new → queued → notified → acknowledged → remediated / disputed / false_positive / suppressed), evidence types kev_verified / kev_inferred / ics / appliance / compromise_tag / shadowserver / ioc_match, refreshed nightly; `list`, `set`, `digest` (remediation measurement). | [docs/LEADS.md](docs/LEADS.md) |
+| Packets | `make_packet.py` | `--org` / `--ip` → Fletcher-style notification (markdown, optional PDF) in `reports/packets/`, with attribution basis, scan age, uncertainty and a reviewer sign-off block. | [docs/LEADS.md](docs/LEADS.md) |
+| Shadowserver | `ingest_shadowserver.py` | Parses report CSVs dropped in `reference/shadowserver/incoming/` into `shadowserver_events`; API client for the reports API once the state (via OTS, as netblock owner) subscribes and keys are in `.env`. | [docs/LEADS.md](docs/LEADS.md) |
+
+Still needed from outside the box: the **OTS state CIDR/ASN list**
+(`reference/registry/ots_cidrs.csv`), a **Shadowserver subscription**, LONI
+member subnets, and the LDNR operator list (manual drop-in). Phase 3 (Team
+Cymru comms, GTI/VirusTotal, CrowdStrike Falcon) runs only against the
+allowlist of sector hosts this phase produces.
+
 ## Daily cron (runs as the owning user, e.g. mike)
 
 ```cron
@@ -195,8 +218,8 @@ query is a delta of re-scanned hosts.
 30 23 * * * /opt/shodan_query/run_nightly.sh >> /opt/shodan_query/cron.log 2>&1
 # morning repair: re-pull any recent day that is missing or came back partial
 0 6 * * *   /opt/shodan_query/venv/bin/python /opt/shodan_query/backfill_missed.py >> /opt/shodan_query/cron.log 2>&1
-# weekly KEV/EPSS/GeoIP refresh
-0 23 * * 0  /opt/shodan_query/venv/bin/python /opt/shodan_query/refresh_reference.py >> /opt/shodan_query/cron.log 2>&1
+# weekly maintenance: KEV/EPSS/GeoIP, exploit index, IOC feeds, rosters, CT discovery, owner registry
+30 21 * * 0 /opt/shodan_query/run_weekly.sh >> /opt/shodan_query/cron.log 2>&1
 ```
 
 Collector exit codes: `0` success, `1` setup/primary-query failure, `2` zero

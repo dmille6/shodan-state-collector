@@ -24,7 +24,7 @@ def test_feed_parsers():
     assert rr.parse_cidr_lines(b"; hdr\n1.2.3.0/24 ; SBL1\n", "spamhaus_drop") == {"1.2.3.0/24": {"spamhaus_drop"}}
     tf = b'# hdr\n"2026-09-01 00:00:00", "1", "9.9.9.9:443", "ip:port", "botnet_cc"\n'
     assert rr.parse_threatfox(tf) == {"9.9.9.9": {"threatfox"}}
-    assert rr.parse_urlhaus(b"http://1.1.1.1:8080/bin.sh\nhttp://evil.example/x\n") == {"1.1.1.1": {"urlhaus"}}
+    assert rr.parse_urlhaus(b"http://1.1.1.1:8080/bin.sh\nhttp://evil.example/x\nhttp://1.2.3.4.example.org/x\n") == {"1.1.1.1": {"urlhaus"}}
 
 
 def test_has_exploit_projected():
@@ -99,3 +99,67 @@ def test_appliance_and_ioc_views():
     appl = dict(con.execute("select ip, appliance from appliance_exposure order by ip").fetchall())
     assert appl == {"10.0.0.1": "Fortinet FortiGate/FortiOS", "10.0.0.2": "Citrix NetScaler/Gateway"}   # 'Fortitude' is not FortiGate
     assert con.execute("select ip, ioc_sources from ioc_matches").fetchall() == [("10.0.0.3", "cins")]
+
+
+
+def test_real_attributor_prefix_changes_stored_tier():
+    """Integration: the real registry.Attributor, a curated /24, and build_day."""
+    registry = pytest.importorskip("registry")
+    a = registry.Attributor()
+    a.orgs["la-ots"] = {"org_id": "la-ots", "name": "Louisiana Office of Technology Services",
+                        "sector": "government", "jurisdiction": "state"}
+    a.networks.add("203.0.113.0/24", {"org_id": "la-ots", "source": "curated", "confidence": "high"})
+    b = banner(org="Cox Communications", hostnames=["wsip-1-2-3-4.br.br.cox.net"], domains=["cox.net"])
+    d = tempfile.mkdtemp(); gz = os.path.join(d, "louisiana-events-2026-09-01.json.gz")
+    import gzip
+    with gzip.open(gz, "wt") as f:
+        f.write(json.dumps(b) + "\n")
+    of, vf = open(os.path.join(d, "o"), "w"), open(os.path.join(d, "v"), "w")
+    bs.build_day(gz, set(), {}, of, vf, lambda r: True, attributor=a)
+    of.close(); vf.close()
+    o = json.loads(open(of.name).readline())
+    assert o["tier"] == "government" and o["attr_method"] == "registry_network"
+    assert "Office of Technology Services" in o["tier_reason"] and "keyword said residential" in o["tier_reason"]
+
+
+def test_domain_or_cert_attribution_never_sets_the_tier():
+    for method in ("domain_dns", "cert", "registry_asn", "roster_name", "arin_rdap"):
+        a = {"org_id": "la-ochsner", "org_name": "Ochsner", "sector": "healthcare",
+             "method": method, "confidence": "high", "evidence": "x"}
+        assert bs.registry_tier(a) is None, method
+    assert bs.registry_tier({"org_id": "x", "sector": "government", "method": "ots_cidr",
+                             "confidence": "high", "evidence": "prefix 10.0.0.0/8 (ots)"}) == "government"
+    assert bs.registry_tier({"org_id": "x", "sector": "government", "method": "registry_network",
+                             "confidence": "high", "evidence": "prefix; also matches la-y"}) is None
+    assert bs.registry_tier({"org_id": "x", "sector": "government", "method": "ots_cidr",
+                             "confidence": "medium", "evidence": "p"}) is None
+
+
+def test_load_attributor_reports_failure_loudly(monkeypatch, capsys):
+    import types, sys as _sys
+    fake = types.ModuleType("registry")
+    class Broken:
+        def load(self, *a, **k): raise RuntimeError("boom")
+    fake.Attributor = Broken
+    monkeypatch.setitem(_sys.modules, "registry", fake)
+    assert bs.load_attributor() is None
+    assert "FAILED to load" in capsys.readouterr().err
+
+
+def test_feed_refresh_keeps_previous_entries_when_a_source_fails(tmp_path, monkeypatch):
+    rr.REF = str(tmp_path)
+    path = tmp_path / "exploits.json"
+    json.dump({"CVE-2020-0001": ["metasploit"], "CVE-2020-0002": ["nuclei"], "_meta": {}}, open(path, "w"))
+    def fake_fetch(url, timeout=60):
+        if "metasploit" in url:
+            raise OSError("down")
+        return b'{"ID":"CVE-2021-0003"}\n'
+    monkeypatch.setattr(rr, "fetch", fake_fetch)
+    rr.refresh_exploits()
+    out = json.load(open(path))
+    assert out["CVE-2020-0001"] == ["metasploit"]          # kept from the previous generation
+    assert "CVE-2020-0002" not in out                       # nuclei refreshed successfully: gone
+    assert out["CVE-2021-0003"] == ["nuclei"] and out["_meta"]["sources"]["metasploit"]["stale"] is True
+    monkeypatch.setattr(rr, "fetch", lambda url, timeout=60: (_ for _ in ()).throw(OSError("all down")))
+    rr.refresh_exploits()
+    assert json.load(open(path)) == out                    # every source failed: file untouched

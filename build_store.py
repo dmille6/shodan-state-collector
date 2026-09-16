@@ -63,13 +63,44 @@ SECTOR_TIER = {"critical_infrastructure": "critical_infrastructure", "healthcare
                "finance": "small_business", "small_business": "small_business", "other": "small_business"}
 
 
+# Attribution methods that establish NETWORK OWNERSHIP of the whole IP. Only
+# these may set a host's tier. A domain or certificate match says "this name
+# is served here", which on shared hosting is not ownership of every service.
+OWNERSHIP_METHODS = {"ots_cidr", "registry_network"}
+
+
 def load_attributor():
+    """registry.Attributor over store/registry/*.parquet, or None when the
+    registry has not been built yet. A failure to load is reported loudly:
+    silently running without the registry hid a broken call once."""
     try:
         import registry
-        return registry.Attributor.load(STORE)
-    except Exception as exc:                       # no registry yet — keyword classifier only
-        print(f"Registry: not available ({exc}); using the keyword classifier only")
+    except ImportError:
+        print("Registry: registry.py not present; using the keyword classifier only")
         return None
+    try:
+        a = registry.Attributor().load()          # default: <store>/registry
+        n = len(a.attribution)
+        print(f"Registry: loaded {len(a.orgs):,} orgs, {n:,} attributed IPs" if n or a.orgs
+              else "Registry: no data yet (run build_registry.py); keyword classifier only")
+        return a if (n or a.orgs) else None
+    except Exception as exc:
+        print(f"Registry: FAILED to load ({exc!r}); using the keyword classifier only", file=sys.stderr)
+        return None
+
+
+def registry_tier(a):
+    """The tier a registry attribution may impose, or None. Requires HIGH
+    confidence, a named org, a network-OWNERSHIP method, and no competing
+    candidate in the evidence."""
+    if not a or a.get("confidence") != "high" or not a.get("org_id"):
+        return None
+    if a.get("method") not in OWNERSHIP_METHODS:
+        return None
+    if "also matches" in (a.get("evidence") or ""):
+        return None
+    sector = (a.get("sector") or "").split("|")[0]
+    return SECTOR_TIER.get(sector)
 
 
 def date_from_name(path):
@@ -225,15 +256,14 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep, exploits=None, attribut
         a = attributor.lookup(ip) if attributor else None
         if a:
             attr_of[ip] = a
-            sector = (a.get("sector") or "").split("|")[0]
-            if a.get("confidence") == "high" and sector in SECTOR_TIER and a.get("org_id"):
-                # The registry knows the owner: its sector wins over keywords, but
-                # honeypot evidence still wins over everything.
-                if tier_of[ip] != "honeypot":
-                    tier_of[ip] = SECTOR_TIER[sector]
-                    reason_of[ip] = (f"registry: {a.get('org_name')} ({a.get('method')}, high)"
-                                     + (" [keyword said " + tr.classify(h)[0] + "]"
-                                        if tr.classify(h)[0] != SECTOR_TIER[sector] else ""))
+            rt = registry_tier(a)
+            # The registry OWNS this address space: its sector wins over keywords,
+            # but honeypot evidence still wins over everything.
+            if rt and tier_of[ip] != "honeypot":
+                kw_tier = tier_of[ip]
+                tier_of[ip] = rt
+                reason_of[ip] = (f"registry: {a.get('org_name')} ({a.get('method')}, high)"
+                                 + (f" [keyword said {kw_tier}]" if kw_tier != rt else ""))
 
     # Pass 2: stream banners → write obs + vuln rows straight to temp files.
     # We keep ONLY the exposure-relevant fields (never the giant http body), so
@@ -468,9 +498,29 @@ def refresh_views(con):
     con.execute("CREATE OR REPLACE TABLE ioc_ips (ip VARCHAR, sources VARCHAR)")
     if rows:
         con.executemany("INSERT INTO ioc_ips VALUES (?, ?)", rows)
+    # CIDR lists (Spamhaus DROP) matched by IPv4 range.
+    import ipaddress
+    crows = []
+    for cidr, srcs in (ioc.get("_cidrs") or {}).items():
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue
+        if net.version == 4:
+            crows.append((cidr, int(net.network_address), int(net.broadcast_address), ",".join(srcs)))
+    con.execute("CREATE OR REPLACE TABLE ioc_cidrs (cidr VARCHAR, lo UBIGINT, hi UBIGINT, sources VARCHAR)")
+    if crows:
+        con.executemany("INSERT INTO ioc_cidrs VALUES (?, ?, ?, ?)", crows)
     con.execute("""
         CREATE OR REPLACE VIEW ioc_matches AS
-        SELECT cs.*, i.sources AS ioc_sources FROM current_state cs JOIN ioc_ips i ON i.ip = cs.ip
+        WITH cs AS (
+          SELECT *, CASE WHEN ip NOT LIKE '%:%' AND regexp_matches(ip, '^[0-9.]+$') THEN
+              CAST(split_part(ip,'.',1) AS UBIGINT)*16777216 + CAST(split_part(ip,'.',2) AS UBIGINT)*65536
+            + CAST(split_part(ip,'.',3) AS UBIGINT)*256 + CAST(split_part(ip,'.',4) AS UBIGINT) END AS ip_int
+          FROM current_state)
+        SELECT cs.* EXCLUDE (ip_int), i.sources AS ioc_sources, NULL AS ioc_cidr FROM cs JOIN ioc_ips i ON i.ip = cs.ip
+        UNION ALL
+        SELECT cs.* EXCLUDE (ip_int), c.sources, c.cidr FROM cs JOIN ioc_cidrs c ON cs.ip_int BETWEEN c.lo AND c.hi
     """)
     # Exposure lifecycle: first/last seen + dwell for each ip:port:transport.
     con.execute("""

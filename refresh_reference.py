@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
@@ -67,6 +68,27 @@ def fetch(url, timeout=60):
         return r.read()
 
 
+def write_json_atomic(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh)
+    os.replace(tmp, path)
+
+
+def previous_entries(path, source, key_filter=lambda k: not k.startswith("_")):
+    """Entries a previous generation of `path` attributed to `source` — kept
+    when that source fails today (a failed fetch is not an empty result)."""
+    prev = {}
+    try:
+        old = json.load(open(path))
+    except Exception:
+        return prev
+    for k, v in old.items():
+        if key_filter(k) and isinstance(v, list) and source in v:
+            prev[k] = {source}
+    return prev
+
+
 # --- Exploit availability -----------------------------------------------------
 # Public indices of CVEs with a working public exploit or detection template.
 # A KEV entry says "exploited in the wild"; these say "anyone can run it today".
@@ -107,21 +129,25 @@ EXPLOIT_SOURCES = [
 
 
 def refresh_exploits():
-    merged = {}
+    path = os.path.join(REF, "exploits.json")
+    merged, status = {}, {}
     for name, url, parser in EXPLOIT_SOURCES:
         try:
             part = parser(fetch(url, timeout=120))
-            for cve, srcs in part.items():
-                merged.setdefault(cve, set()).update(srcs)
+            status[name] = {"ok": True, "entries": len(part)}
             print(f"exploits/{name}: {len(part):,} CVEs")
         except Exception as e:
-            print(f"exploits/{name} failed: {e}")
-    if not merged:
-        print("exploit index: nothing fetched; keeping the previous file")
+            part = previous_entries(path, name)       # last known good, marked stale
+            status[name] = {"ok": False, "error": str(e)[:120], "entries": len(part), "stale": True}
+            print(f"exploits/{name} failed: {e} — keeping {len(part):,} previous entries (stale)")
+        for cve, srcs in part.items():
+            merged.setdefault(cve, set()).update(srcs)
+    if not any(s["ok"] for s in status.values()):
+        print("exploit index: every source failed; previous file kept unchanged")
         return
     out = {cve: sorted(srcs) for cve, srcs in sorted(merged.items())}
-    out["_meta"] = {"as_of": datetime.now().strftime("%Y-%m-%d"), "sources": [n for n, _, _ in EXPLOIT_SOURCES]}
-    json.dump(out, open(os.path.join(REF, "exploits.json"), "w"))
+    out["_meta"] = {"as_of": datetime.now().strftime("%Y-%m-%d"), "sources": status}
+    write_json_atomic(path, out)
     print(f"exploit index: {len(out) - 1:,} CVEs with a public exploit/template")
 
 
@@ -165,12 +191,20 @@ def parse_threatfox(raw):
 
 
 def parse_urlhaus(raw):
-    """URLhaus online URLs: keep only URLs whose host is a literal IPv4."""
+    """URLhaus online URLs: keep only URLs whose HOST is a literal IPv4
+    (parsed as a URL, so 1.2.3.4.example.org is a hostname, not an IP)."""
+    import ipaddress
     out = {}
     for line in raw.decode("utf-8", "replace").splitlines():
-        m = re.match(r"^https?://(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?[/?#]?", line.strip())
-        if m:
-            out.setdefault(m.group(1), set()).add("urlhaus")
+        line = line.strip()
+        if not line.startswith(("http://", "https://")):
+            continue
+        try:
+            host = urllib.parse.urlsplit(line).hostname or ""
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            continue
+        out.setdefault(host, set()).add("urlhaus")
     return out
 
 
@@ -185,23 +219,35 @@ IOC_SOURCES = [
 
 
 def refresh_iocs():
-    ips, cidrs = {}, {}
+    path = os.path.join(REF, "ioc_ips.json")
+    ips, cidrs, status = {}, {}, {}
+    try:
+        prev_cidrs = (json.load(open(path)).get("_cidrs") or {})
+    except Exception:
+        prev_cidrs = {}
     for name, url, parser in IOC_SOURCES:
+        is_cidr = name == "spamhaus_drop"
         try:
             part = parser(fetch(url, timeout=90))
-            target = cidrs if name == "spamhaus_drop" else ips
-            for k, srcs in part.items():
-                target.setdefault(k, set()).update(srcs)
+            status[name] = {"ok": True, "entries": len(part)}
             print(f"ioc/{name}: {len(part):,} entries")
         except Exception as e:
-            print(f"ioc/{name} failed: {e}")
-    if not ips and not cidrs:
-        print("ioc feeds: nothing fetched; keeping the previous file")
+            if is_cidr:
+                part = {c: {name} for c, v in prev_cidrs.items() if name in v}
+            else:
+                part = previous_entries(path, name)
+            status[name] = {"ok": False, "error": str(e)[:120], "entries": len(part), "stale": True}
+            print(f"ioc/{name} failed: {e} — keeping {len(part):,} previous entries (stale)")
+        target = cidrs if is_cidr else ips
+        for k, srcs in part.items():
+            target.setdefault(k, set()).update(srcs)
+    if not any(s["ok"] for s in status.values()):
+        print("ioc feeds: every source failed; previous file kept unchanged")
         return
     out = {ip: sorted(v) for ip, v in sorted(ips.items())}
     out["_cidrs"] = {c: sorted(v) for c, v in sorted(cidrs.items())}
-    out["_meta"] = {"as_of": datetime.now().strftime("%Y-%m-%d"), "sources": [n for n, _, _ in IOC_SOURCES]}
-    json.dump(out, open(os.path.join(REF, "ioc_ips.json"), "w"))
+    out["_meta"] = {"as_of": datetime.now().strftime("%Y-%m-%d"), "sources": status}
+    write_json_atomic(path, out)
     print(f"ioc feeds: {len(ips):,} IPs + {len(cidrs):,} CIDRs")
 
 
