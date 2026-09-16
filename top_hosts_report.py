@@ -417,7 +417,9 @@ def main():
     if args.include_residential and "residential" not in tiers:
         tiers.append("residential")
     residential_excluded = 0 if args.include_residential else sum(1 for r in rows if r["tier"] == "residential")
-    sections = {t: sorted([r for r in rows if r["tier"] == t], key=lambda r: -r["score"])[:args.per_tier] for t in tiers}
+    # Ties at the cutoff are broken by IP so the list is identical run to run.
+    sections = {t: sorted([r for r in rows if r["tier"] == t], key=lambda r: (-r["score"], r["ip"]))[:args.per_tier]
+                for t in tiers}
     totals = {t: sum(1 for r in rows if r["tier"] == t) for t in tiers}
     os.makedirs(args.out, exist_ok=True)
     stem = os.path.join(args.out, f"top_hosts_{meta['newest_day']}")
