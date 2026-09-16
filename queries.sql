@@ -2,7 +2,7 @@
 --   duckdb store/exposure.duckdb
 -- then paste any query below.
 -- Views: observations, vulns (one row per CVE per observation; join on
--- observation_id), latest_observed (latest banner per ip:port:transport, all
+-- (date, observation_id) — the same cached record can recur on several days), latest_observed (latest banner per ip:port:transport, all
 -- time), exposure_status (latest_observed + status active/stale/gone by days
 -- since seen), current_state (= exposure_status WHERE status = 'active', i.e.
 -- seen in the last 14 days — "exposed right now"), lifecycle (first/last seen).
@@ -15,7 +15,7 @@ SELECT cs.tier,
        count(DISTINCT cs.ip)                           AS unique_hosts,
        count(DISTINCT CASE WHEN v.in_kev THEN cs.ip END) AS hosts_with_kev
 FROM current_state cs
-LEFT JOIN vulns v ON v.observation_id = cs.observation_id
+LEFT JOIN vulns v ON v.observation_id = cs.observation_id AND v.date = cs.date
 GROUP BY cs.tier
 ORDER BY hosts_with_kev DESC;
 
@@ -23,7 +23,7 @@ ORDER BY hosts_with_kev DESC;
 --    (verified first — Shodan confirmed it — then by exploit probability)
 SELECT cs.tier, cs.ip, cs.org, cs.city, v.cve, v.verified, v.cvss, round(v.epss,3) AS epss
 FROM current_state cs
-JOIN vulns v ON v.observation_id = cs.observation_id
+JOIN vulns v ON v.observation_id = cs.observation_id AND v.date = cs.date
 WHERE v.in_kev
   AND cs.tier IN ('critical_infrastructure','government','education')
 ORDER BY v.verified DESC, v.epss DESC NULLS LAST, v.cvss DESC
@@ -32,21 +32,21 @@ LIMIT 25;
 -- 3) NEW exposures on the most recent day (ip:port never seen before)
 SELECT o.tier, o.ip, o.org, o.city, o.port, o.product
 FROM observations o
-JOIN lifecycle l ON l.ip = o.ip AND l.port = o.port
+JOIN lifecycle l ON l.ip = o.ip AND l.port = o.port AND l.transport = o.transport
 WHERE o.date = (SELECT max(date) FROM observations)
   AND l.first_seen = o.date
 ORDER BY o.tier;
 
 -- 4) Longest-standing OPEN exposures (still present on the latest day) — dwell time
-SELECT l.ip, l.port, l.first_seen, l.last_seen, l.span_days, cs.tier, cs.org, cs.product
+SELECT l.ip, l.port, l.transport, l.first_seen, l.last_seen, l.span_days, cs.tier, cs.org, cs.product
 FROM lifecycle l
-JOIN current_state cs ON cs.ip = l.ip AND cs.port = l.port
+JOIN current_state cs ON cs.ip = l.ip AND cs.port = l.port AND cs.transport = l.transport
 WHERE l.last_seen = (SELECT max(date) FROM observations)
 ORDER BY l.span_days DESC, l.first_seen
 LIMIT 25;
 
 -- 5) Possible REMEDIATION: ip:port seen previously but absent on the latest day
-SELECT l.ip, l.port, l.first_seen, l.last_seen AS last_seen_before_gone
+SELECT l.ip, l.port, l.transport, l.first_seen, l.last_seen AS last_seen_before_gone
 FROM lifecycle l
 WHERE l.last_seen < (SELECT max(date) FROM observations)
 ORDER BY l.last_seen DESC
@@ -58,7 +58,7 @@ SELECT cs.org, cs.tier,
        count(DISTINCT CASE WHEN v.in_kev THEN v.cve END)  AS kev_cves,
        round(max(v.epss),3)                               AS worst_epss
 FROM current_state cs
-LEFT JOIN vulns v ON v.observation_id = cs.observation_id
+LEFT JOIN vulns v ON v.observation_id = cs.observation_id AND v.date = cs.date
 GROUP BY cs.org, cs.tier
 HAVING kev_cves > 0
 ORDER BY kev_cves DESC

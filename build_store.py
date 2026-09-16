@@ -73,8 +73,9 @@ _IPISH = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 def observation_id(r):
     """Stable identity of ONE banner observation. Shodan assigns every banner
     record a unique id (_shodan.id); fall back to a digest of the fields that
-    make an observation distinct. This is what vulns rows join on — never
-    (ip, port, date), which can attach another same-day banner's CVEs."""
+    make an observation distinct. vulns rows join on (date, observation_id):
+    the SAME cached record can be re-served on several delta days, so the id
+    alone is not unique across partitions — the date makes the pair unique."""
     sid = (r.get("_shodan") or {}).get("id")
     if sid:
         return str(sid)
@@ -107,10 +108,53 @@ def cert_fields(r):
     }
 
 
+# Certificate subject organisations that name the DEVICE VENDOR or a shared
+# platform, not the operator: a factory or platform cert must never attribute
+# the host. Matched as whole words / prefixes, lower-case.
+VENDOR_CERT_ORGS = ("fortinet", "cisco", "ubiquiti", "mikrotik", "synology", "qnap", "hp",
+                    "hewlett", "dell", "schneider", "siemens", "honeywell", "axis", "hikvision",
+                    "dahua", "sonicwall", "palo alto", "juniper", "netgear", "tp-link", "zyxel",
+                    "draytek", "peplink", "cradlepoint", "digi", "lantronix", "apc", "eaton",
+                    "vmware", "microsoft", "apple", "google", "amazon", "cloudflare", "akamai",
+                    "fastly", "plesk", "cpanel", "sophos", "watchguard", "barracuda", "citrix",
+                    "f5", "aruba", "ruckus", "cambium", "grandstream", "polycom", "yealink",
+                    "avaya", "lenovo", "supermicro", "asus", "d-link", "linksys", "brother",
+                    "canon", "xerox", "ricoh", "konica", "lexmark", "epson", "kyocera",
+                    "default", "example", "test", "internal", "localhost")
+
+
+def cert_is_trustworthy(r):
+    """A certificate attributes an owner only if it was issued by someone other
+    than the subject (not self-signed / not a factory default) and its subject
+    organisation is not a device vendor or shared platform. Self-signed and
+    vendor certs are still STORED (cert_* columns) — they just do not classify."""
+    ssl = r.get("ssl") or {}
+    cert = ssl.get("cert") or {}
+    if not cert:
+        return False
+    tags = {t.lower() for t in (r.get("tags") or [])}
+    if "self-signed" in tags:
+        return False
+    subj = cert.get("subject") or {}
+    iss = cert.get("issuer") or {}
+    if subj and iss and subj == iss:
+        return False
+    if subj.get("CN") and iss.get("CN") and subj.get("CN") == iss.get("CN"):
+        return False
+    o = (subj.get("O") or "").lower().strip()
+    if o and any(o == v or o.startswith(v + " ") or o.startswith(v + ",") for v in VENDOR_CERT_ORGS):
+        return False
+    return True
+
+
 def identity_names(r):
-    """Names a banner reveals about its OWNER beyond rDNS: certificate CN and
-    SANs (wildcards stripped) and the HTTP Host header. Fed to classify() as
-    hostnames so a hospital cert on Cox space attributes the hospital."""
+    """DNS names a TRUSTWORTHY certificate (see cert_is_trustworthy) reveals
+    about the owner: CN and SANs, wildcards stripped. Fed to classify() as
+    hostnames so a hospital cert on Cox space attributes the hospital. The HTTP
+    Host header is deliberately NOT used: it is the name Shodan chose for its
+    request, not evidence of ownership (it is still stored as http_host)."""
+    if not cert_is_trustworthy(r):
+        return set()
     names = set()
     cf = cert_fields(r)
     for n in ([cf["cert_cn"]] if cf["cert_cn"] else []) + cf["cert_sans"].split(","):
@@ -119,9 +163,6 @@ def identity_names(r):
             n = n[2:]
         if n and "." in n and " " not in n and not _IPISH.match(n):
             names.add(n)
-    host = ((r.get("http") or {}).get("host") or "").lower().strip().rstrip(".")
-    if host and "." in host and not _IPISH.match(host.split(":")[0]):
-        names.add(host.split(":")[0])
     return names
 
 
@@ -148,13 +189,14 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
         h["domains"].update(r.get("domains") or [])
         h["tags"].update(r.get("tags") or [])       # honeypot tag feeds classify()
         co = cert_fields(r)["cert_org"]
-        if co:
-            h["cert_orgs"].add(co)                  # cert subject O = self-asserted owner
+        if co and cert_is_trustworthy(r):
+            h["cert_orgs"].add(co)                  # CA-issued, non-vendor cert O = owner
     tier_of = {}
+    reason_of = {}
     for ip, h in hosts.items():
         h["hostnames"] = sorted(h["hostnames"])
         h["domains"] = sorted(h["domains"])
-        tier_of[ip], _ = tr.classify(h)
+        tier_of[ip], reason_of[ip] = tr.classify(h)     # reason kept as an audit trail
 
     # Pass 2: stream banners → write obs + vuln rows straight to temp files.
     # We keep ONLY the exposure-relevant fields (never the giant http body), so
@@ -193,6 +235,7 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             # us tell a fresh observation from a re-served cached banner.
             "banner_ts": r.get("timestamp"),
             "hash": str(r.get("hash")), "tier": tier_of.get(ip),
+            "tier_reason": reason_of.get(ip),
             # HTTP identity + TLS certificate (owner evidence; see cert_fields)
             "http_title": http.get("title"), "http_host": http.get("host"),
             "http_server": http.get("server"),
@@ -239,6 +282,7 @@ SELECT CAST(observation_id AS VARCHAR) AS observation_id,
        CAST(asn AS VARCHAR) AS asn, org, isp, product, CAST(version AS VARCHAR) AS version,
        cpe23, service, info, city, region_code, hostnames, domains, tags,
        CAST(banner_ts AS TIMESTAMP) AS banner_ts, hash, tier,
+       CAST(tier_reason AS VARCHAR) AS tier_reason,
        CAST(http_title AS VARCHAR) AS http_title, CAST(http_host AS VARCHAR) AS http_host,
        CAST(http_server AS VARCHAR) AS http_server,
        CAST(cert_cn AS VARCHAR) AS cert_cn, CAST(cert_org AS VARCHAR) AS cert_org,
@@ -271,21 +315,31 @@ def refresh_views(con):
                 f"SELECT * FROM read_parquet('{obs_glob}', union_by_name=true)")
     con.execute(f"CREATE OR REPLACE VIEW vulns AS "
                 f"SELECT * FROM read_parquet('{vuln_glob}', union_by_name=true)")
-    # Latest banner per ip:port:transport, ALL-TIME, with a deterministic order
-    # (banner scan time, then collection date, then the record id) so the same
-    # inputs always pick the same row.
+    # Mixed-schema guard: partitions written before Phase 1 have no
+    # observation_id and cannot join to vulns. Say so loudly.
+    legacy = con.execute("SELECT count(*) FROM observations WHERE observation_id IS NULL").fetchone()[0]
+    if legacy:
+        print(f"WARNING: {legacy:,} observation rows predate the observation_id schema — "
+              f"their CVEs will not join. Run ./rebuild_store.sh to migrate the whole store.",
+              file=sys.stderr)
+    # Latest banner per ip:port:transport, ALL-TIME, with a deterministic order:
+    # collection date first (the authoritative "last seen" — a banner_ts can be
+    # missing or an ancient cached scan), then banner scan time, then record id.
     con.execute("""
         CREATE OR REPLACE VIEW latest_observed AS
         SELECT * EXCLUDE (rn) FROM (
           SELECT *, row_number() OVER (
                    PARTITION BY ip, port, transport
-                   ORDER BY banner_ts DESC NULLS LAST, date DESC, observation_id DESC) AS rn
+                   ORDER BY date DESC, banner_ts DESC NULLS LAST, observation_id DESC) AS rn
           FROM observations
         ) WHERE rn = 1
     """)
     # Freshness. current_state = "exposed right now" = latest observation seen
     # within ACTIVE_DAYS of the newest day in the store. exposure_status keeps
-    # every latest observation and labels it active / stale / gone.
+    # every latest observation and labels it active / stale / gone. The clock
+    # is the newest day IN THE STORE: if ingestion stops, nothing ages — that
+    # is what the nightly dead-man ping is for, and days_since_seen is exposed
+    # so a report can also state how old the newest day itself is.
     con.execute(f"""
         CREATE OR REPLACE VIEW exposure_status AS
         SELECT *,
@@ -299,14 +353,14 @@ def refresh_views(con):
         CREATE OR REPLACE VIEW current_state AS
         SELECT * EXCLUDE (days_since_seen, status) FROM exposure_status WHERE status = 'active'
     """)
-    # Exposure lifecycle: first/last seen + dwell for each ip:port.
+    # Exposure lifecycle: first/last seen + dwell for each ip:port:transport.
     con.execute("""
         CREATE OR REPLACE VIEW lifecycle AS
-        SELECT ip, port,
+        SELECT ip, port, transport,
                min(date) AS first_seen, max(date) AS last_seen,
                count(DISTINCT date) AS days_observed,
                date_diff('day', min(date), max(date)) + 1 AS span_days
-        FROM observations GROUP BY ip, port
+        FROM observations GROUP BY ip, port, transport
     """)
 
 

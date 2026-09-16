@@ -36,8 +36,10 @@ stale hits therefore no longer cause nightly alert fatigue, and a genuinely new
 compromised host stands out. Hosts that stop being flagged are noted as CLEARED.
 
 Exit codes: 0 clean or ongoing-only (nothing new), 10 NEW or RECURRED hit(s) —
-investigate, 5 provider failure (a count or search failed: the run is
-INCOMPLETE and nothing was marked cleared), 1 setup error.
+investigate (takes precedence over 5), 5 provider failure with nothing new (a
+count or search failed: the run is INCOMPLETE and nothing was marked cleared),
+1 setup error. Incompleteness is always also written to the alert file and to
+the ledger (_meta.last_run_incomplete).
 """
 import argparse
 import gzip
@@ -99,10 +101,17 @@ def count(api, query, retries=3, backoff=15):
 
 
 def search_all(api, query, retries=3, backoff=15, max_pages=50):
-    """Page a (small) compromise query fully. Compromise result sets are tiny, so
-    this is cheap; max_pages is only a runaway backstop. Yields banner dicts."""
+    """Page a (small) compromise query fully. Returns (banners, complete).
+    complete is False when a page failed after retries, a page came back empty
+    before the reported total was reached, or the page cap was hit — in every
+    such case the banners already fetched are still returned, but the caller
+    must treat the selector as FAILED (nothing may be marked cleared)."""
+    banners = []
     page = 1
-    while page <= max_pages:
+    while True:
+        if page > max_pages:
+            log(f"    page cap ({max_pages}) reached — result truncated")
+            return banners, False
         delay = backoff
         res = None
         for attempt in range(1, retries + 1):
@@ -112,17 +121,16 @@ def search_all(api, query, retries=3, backoff=15, max_pages=50):
             except shodan.APIError as exc:
                 if attempt == retries:
                     log(f"    page {page}: failed after {retries} attempts ({exc})")
-                    return
+                    return banners, False
                 time.sleep(min(delay, 30))
                 delay *= 2
         matches = (res or {}).get("matches", [])
-        if not matches:
-            return
-        for m in matches:
-            yield m
         total = (res or {}).get("total", 0)
+        if not matches:
+            return banners, (page - 1) * 100 >= total     # empty page early = truncated
+        banners.extend(matches)
         if page * 100 >= total:
-            return
+            return banners, True
         page += 1
 
 
@@ -276,8 +284,12 @@ def main():
             continue
         if args.dry_run:
             continue
+        banners, complete = search_all(api, query)
+        if not complete:
+            failed.append(label)
+            log(f"    {label}: search INCOMPLETE — {len(banners)} banner(s) kept, selector marked FAILED")
         got = 0
-        for banner in search_all(api, query):
+        for banner in banners:
             got += 1
             total_matches += 1
             if not in_state(banner):
@@ -303,7 +315,7 @@ def main():
             h["selectors"].add(label)
             banner["_compromise_selector"] = label
             h["banners"].append(banner)
-        if got == 0:
+        if got == 0 and complete:
             # count said > 0 but the paid search returned nothing: a provider
             # failure, not an empty result. Must not be read as "cleared".
             failed.append(label)
@@ -368,8 +380,12 @@ def main():
 
     with open(txt_path, "w") as fh:
         fh.write(f"COMPROMISE ALERT — {state_code} — {iso}\n")
-        fh.write(f"{len(new_ips)} NEW, {len(ongoing_ips)} ongoing, "
-                 f"{len(cleared_ips)} cleared. Shodan compromise flags (tag/category).\n\n")
+        fh.write(f"{len(new_ips)} NEW (incl. {len(recurred_ips)} recurred), {len(ongoing_ips)} ongoing, "
+                 f"{len(cleared_ips)} cleared. Shodan compromise flags (tag/category).\n")
+        if failed:
+            fh.write(f"RUN INCOMPLETE: selector(s) failed: {', '.join(failed)} — nothing marked cleared; "
+                     f"previously active hosts carried forward.\n")
+        fh.write("\n")
         for ip in new_ips + ongoing_ips:
             fh.write(line(ip) + "\n")
         for ip in cleared_ips:
@@ -378,10 +394,13 @@ def main():
     save_ledger(ledger)
 
     if new_ips:
+        # Precedence: a NEW/RECURRED hit outranks an incomplete run — exit 10 so
+        # the alert fires; incompleteness is recorded in the alert file, the log
+        # and the ledger (_meta.last_run_incomplete) so it is not lost.
         bar = "=" * 72
         log(bar)
         log(f"⚠  COMPROMISE ALERT: {len(new_ips)} NEW flagged host(s) in {state_code} "
-            f"on {iso}  ({len(ongoing_ips)} ongoing)")
+            f"on {iso}  ({len(ongoing_ips)} ongoing){' — RUN INCOMPLETE, see above' if failed else ''}")
         for ip in new_ips:
             log("   " + line(ip))
         if ongoing_ips:

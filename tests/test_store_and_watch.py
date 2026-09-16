@@ -77,9 +77,10 @@ def test_cert_fields_and_identity_names():
     assert cf["cert_cn"] == "vpn.ololrmc.com" and cf["cert_org"].startswith("Our Lady")
     assert cf["cert_sans"] == "*.ololrmc.com,portal.ololrmc.com,vpn.ololrmc.com"
     assert cf["cert_expired"] is False and cf["cert_sha256"] == "ab" * 32 and cf["jarm"] == "29d29d"
-    assert bs.identity_names(b) == {"vpn.ololrmc.com", "ololrmc.com", "portal.ololrmc.com"}
+    assert bs.identity_names(b) == {"vpn.ololrmc.com", "ololrmc.com", "portal.ololrmc.com"}   # CN + SANs
+    assert bs.identity_names(banner(http={"host": "hidden.example"})) == set()   # HTTP Host is NOT identity
     assert bs.cert_fields(banner())["cert_cn"] is None
-    assert bs.identity_names(banner(http={"host": "203.0.113.10:8443"})) == set()
+    assert bs.identity_names(banner(http={"host": "portal.ololrmc.com"})) == set()
 
 
 def run_build_day(banners):
@@ -138,6 +139,7 @@ def test_freshness_views_split_active_stale_gone():
                              "version": None, "cpe23": "", "service": "https", "info": None, "city": None,
                              "region_code": "LA", "hostnames": "", "domains": "", "tags": "",
                              "banner_ts": f"{date}T00:00:00", "hash": "1", "tier": "small_business",
+                             "tier_reason": "r",
                              "http_title": None, "http_host": None, "http_server": None, "cert_cn": None,
                              "cert_org": None, "cert_issuer": None, "cert_sans": "", "cert_expired": None,
                              "cert_expires": None, "cert_sha256": None, "jarm": None}) + "\n")
@@ -154,8 +156,9 @@ def test_freshness_views_split_active_stale_gone():
     cur = con.execute("select ip, observation_id from current_state").fetchall()
     assert cur == [("10.0.0.1", "10.0.0.1-2026-09-14")]          # latest row wins, one per ip:port:transport
     assert con.execute("select count(*) from latest_observed").fetchone()[0] == 3
-    joined = con.execute("select count(*) from current_state cs join vulns v on v.observation_id = cs.observation_id").fetchone()[0]
+    joined = con.execute("select count(*) from current_state cs join vulns v on v.observation_id = cs.observation_id and v.date = cs.date").fetchone()[0]
     assert joined == 1
+    assert con.execute("select transport from lifecycle limit 1").fetchone()[0] == "tcp"
 
 
 # --- tripwire failure semantics -------------------------------------------------
@@ -184,3 +187,75 @@ def test_reconcile_recurred_host_is_alarming_again():
     new, ongoing, cleared, recurred = cw.reconcile({"1.1.1.1": hit("1.1.1.1")}, ledger, "2026-09-01")
     assert recurred == ["1.1.1.1"] and new == [] and ongoing == []
     assert ledger["hosts"]["1.1.1.1"]["first_seen"] == "2026-07-01"     # history preserved
+
+
+# --- second-pass cases (Codex review of this batch) ------------------------------
+
+def test_same_record_id_on_two_days_joins_only_its_own_day():
+    duckdb = pytest.importorskip("duckdb")
+    d = tempfile.mkdtemp()
+    bs.STORE = d; bs.OBS_DIR = os.path.join(d, "observations"); bs.VULN_DIR = os.path.join(d, "vulns")
+    con = duckdb.connect(os.path.join(d, "t.duckdb"))
+    for date, cves in (("2026-09-01", ["CVE-X", "CVE-Y"]), ("2026-09-02", ["CVE-X"])):   # cached record re-served; CVE-Y dropped
+        of = open(os.path.join(d, f"{date}.ndjson"), "w")
+        of.write(json.dumps({"observation_id": "same-id", "date": date, "ip": "10.0.0.9", "port": 443,
+                             "transport": "tcp", "asn": "AS1", "org": "x", "isp": "x", "product": None,
+                             "version": None, "cpe23": "", "service": "https", "info": None, "city": None,
+                             "region_code": "LA", "hostnames": "", "domains": "", "tags": "",
+                             "banner_ts": None, "hash": "1", "tier": "small_business", "tier_reason": "r",
+                             "http_title": None, "http_host": None, "http_server": None, "cert_cn": None,
+                             "cert_org": None, "cert_issuer": None, "cert_sans": "", "cert_expired": None,
+                             "cert_expires": None, "cert_sha256": None, "jarm": None}) + "\n")
+        of.close(); bs.copy_to_partition(con, of.name, 1, bs.OBS_DIR, date, bs.OBS_SELECT)
+        vf = open(os.path.join(d, f"{date}.v.ndjson"), "w")
+        for c in cves:
+            vf.write(json.dumps({"observation_id": "same-id", "date": date, "ip": "10.0.0.9", "port": 443, "transport": "tcp",
+                                 "cve": c, "cvss": 5.0, "in_kev": False, "epss": 0.1, "verified": False}) + "\n")
+        vf.close(); bs.copy_to_partition(con, vf.name, len(cves), bs.VULN_DIR, date, bs.VULN_SELECT)
+    bs.refresh_views(con)
+    # a NULL banner_ts on the newest day must still win (collection date first)
+    assert con.execute("select date from current_state").fetchone()[0].isoformat() == "2026-09-02"
+    cves = [r[0] for r in con.execute("""select v.cve from current_state cs join vulns v
+             on v.observation_id = cs.observation_id and v.date = cs.date""").fetchall()]
+    assert cves == ["CVE-X"]           # not CVE-Y from the older day, not doubled
+
+
+def test_untrustworthy_certificates_do_not_attribute():
+    selfsigned = dict(HOSPITAL_CERT, issuer=HOSPITAL_CERT["subject"])
+    assert bs.identity_names(banner(cert=selfsigned)) == set()
+    assert bs.identity_names(banner(cert=HOSPITAL_CERT, tags=["self-signed"])) == set()
+    vendor = dict(HOSPITAL_CERT, subject={"CN": "FortiGate", "O": "Fortinet"})
+    assert bs.identity_names(banner(cert=vendor)) == set()
+    b = banner(org="Cox Communications", cert=dict(HOSPITAL_CERT, subject={"CN": "vpn.x", "O": "Schneider Electric"}))
+    _, obs, _ = run_build_day([b])
+    assert obs[0]["tier"] != "critical_infrastructure" and obs[0]["cert_org"] == "Schneider Electric"
+    _, obs, _ = run_build_day([banner(cert=HOSPITAL_CERT)])
+    assert obs[0]["tier"] == "critical_infrastructure" and "medical" in obs[0]["tier_reason"]
+
+
+class FakeAPI:
+    """Scripted Shodan search: pages -> list of (matches or Exception)."""
+    def __init__(self, pages, total):
+        self.pages, self.total = pages, total
+    def search(self, query, page=1, minify=False):
+        item = self.pages[page - 1]
+        if isinstance(item, Exception):
+            raise item
+        return {"matches": item, "total": self.total}
+
+
+def test_search_all_reports_incomplete_on_page_failure_and_truncation(monkeypatch):
+    import shodan
+    monkeypatch.setattr(cw.time, "sleep", lambda s: None)
+    ok = FakeAPI([[{"ip_str": f"1.1.1.{i}"} for i in range(100)], [{"ip_str": "2.2.2.2"}]], total=101)
+    banners, complete = cw.search_all(ok, "q")
+    assert complete and len(banners) == 101
+    bad = FakeAPI([[{"ip_str": f"1.1.1.{i}"} for i in range(100)], shodan.APIError("cursor timed out")], total=150)
+    banners, complete = cw.search_all(bad, "q", retries=2, backoff=0)
+    assert not complete and len(banners) == 100          # page-1 hits kept, selector incomplete
+    early = FakeAPI([[{"ip_str": "3.3.3.3"}], []], total=150)
+    banners, complete = cw.search_all(early, "q")
+    assert not complete and len(banners) == 1            # premature empty page
+    capped = FakeAPI([[{"ip_str": "4.4.4.4"}] * 100] * 3, total=100000)
+    banners, complete = cw.search_all(capped, "q", max_pages=2)
+    assert not complete and len(banners) == 200
