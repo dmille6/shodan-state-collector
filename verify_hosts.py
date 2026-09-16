@@ -386,12 +386,10 @@ def main():
     for n, ip in enumerate(ips, 1):
         rd = rdap_ip(ip, rdap_cache)
         idb = internetdb(ip, idb_cache)
-        sh = None
-        if api and credits < args.shodan_credits:
-            cached = sh_cache.get(ip)
-            sh = cached or shodan_host(api, ip, sh_cache)
-            if not cached:
-                credits += 1
+        sh = sh_cache.get(ip)                 # a cached record costs nothing
+        if sh is None and api and credits < args.shodan_credits:
+            sh = shodan_host(api, ip, sh_cache)
+            credits += 1
         results[ip] = verify_ip(ip, facts, rd, idb, sh, maxmind(ip), kev_meta)
         if n % 25 == 0:
             log(f"  {n}/{len(ips)} done")
