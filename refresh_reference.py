@@ -11,11 +11,13 @@ import gzip
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
 import tempfile
 import urllib.request
+from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REF = os.path.join(SCRIPT_DIR, "reference")
@@ -52,6 +54,155 @@ def refresh_epss():
         except Exception as e:
             print(f"  {url} failed: {e}")
     print("EPSS refresh failed (all sources)")
+
+
+UA = {"User-Agent": "shodan-state-collector/1.0 (Louisiana exposure census; passive)"}
+CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.I)
+IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def fetch(url, timeout=60):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+# --- Exploit availability -----------------------------------------------------
+# Public indices of CVEs with a working public exploit or detection template.
+# A KEV entry says "exploited in the wild"; these say "anyone can run it today".
+# Tiebreaker for triage, never a gate.
+
+def parse_metasploit(raw):
+    """modules_metadata_base.json -> {cve: ['metasploit']} from module references."""
+    out = {}
+    data = json.loads(raw)
+    for mod in data.values():
+        for ref in (mod.get("references") or []):
+            for cve in CVE_RE.findall(str(ref)):
+                out.setdefault(cve.upper(), set()).add("metasploit")
+    return out
+
+
+def parse_nuclei(raw):
+    """nuclei-templates cves.json (newline-delimited objects with an ID) -> {cve: ['nuclei']}."""
+    out = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip().rstrip(",")
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        cve = str(obj.get("ID") or "").upper()
+        if CVE_RE.fullmatch(cve):
+            out.setdefault(cve, set()).add("nuclei")
+    return out
+
+
+EXPLOIT_SOURCES = [
+    ("metasploit", "https://raw.githubusercontent.com/rapid7/metasploit-framework/master/db/modules_metadata_base.json", parse_metasploit),
+    ("nuclei", "https://raw.githubusercontent.com/projectdiscovery/nuclei-templates/main/cves.json", parse_nuclei),
+]
+
+
+def refresh_exploits():
+    merged = {}
+    for name, url, parser in EXPLOIT_SOURCES:
+        try:
+            part = parser(fetch(url, timeout=120))
+            for cve, srcs in part.items():
+                merged.setdefault(cve, set()).update(srcs)
+            print(f"exploits/{name}: {len(part):,} CVEs")
+        except Exception as e:
+            print(f"exploits/{name} failed: {e}")
+    if not merged:
+        print("exploit index: nothing fetched; keeping the previous file")
+        return
+    out = {cve: sorted(srcs) for cve, srcs in sorted(merged.items())}
+    out["_meta"] = {"as_of": datetime.now().strftime("%Y-%m-%d"), "sources": [n for n, _, _ in EXPLOIT_SOURCES]}
+    json.dump(out, open(os.path.join(REF, "exploits.json"), "w"))
+    print(f"exploit index: {len(out) - 1:,} CVEs with a public exploit/template")
+
+
+# --- Free IOC feeds ---------------------------------------------------------------
+# Matched LOCALLY against Louisiana IPs (nothing leaves the box). A hit means the IP
+# is on a C2/malware/abuse list — a lead that the host is compromised or hostile.
+# Residential matches are only ever reported as ISP aggregates (see leads.py).
+
+def parse_ip_lines(raw, source):
+    out = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.split("#")[0].split(";")[0].strip()
+        if IPV4_RE.match(line):
+            out.setdefault(line, set()).add(source)
+    return out
+
+
+def parse_cidr_lines(raw, source):
+    """Spamhaus DROP: '1.2.3.0/24 ; SBL123'. Returned under the '_cidrs' key."""
+    out = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        cidr = line.split(";")[0].strip()
+        if "/" in cidr and IPV4_RE.match(cidr.split("/")[0]):
+            out.setdefault(cidr, set()).add(source)
+    return out
+
+
+def parse_threatfox(raw):
+    """ThreatFox ip-port CSV: quoted columns, ioc_value = ip:port."""
+    out = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if line.startswith("#"):
+            continue
+        row = next(csv.reader([line], skipinitialspace=True), None)   # ThreatFox writes '", "'.
+        if not row or len(row) < 3:
+            continue
+        ip = row[2].strip().split(":")[0]
+        if IPV4_RE.match(ip):
+            out.setdefault(ip, set()).add("threatfox")
+    return out
+
+
+def parse_urlhaus(raw):
+    """URLhaus online URLs: keep only URLs whose host is a literal IPv4."""
+    out = {}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        m = re.match(r"^https?://(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?[/?#]?", line.strip())
+        if m:
+            out.setdefault(m.group(1), set()).add("urlhaus")
+    return out
+
+
+IOC_SOURCES = [
+    ("feodo", "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", lambda r: parse_ip_lines(r, "feodo")),
+    ("sslbl", "https://sslbl.abuse.ch/blacklist/sslipblacklist.txt", lambda r: parse_ip_lines(r, "sslbl")),
+    ("threatfox", "https://threatfox.abuse.ch/export/csv/ip-port/recent/", parse_threatfox),
+    ("urlhaus", "https://urlhaus.abuse.ch/downloads/text_online/", parse_urlhaus),
+    ("cins", "https://cinsscore.com/list/ci-badguys.txt", lambda r: parse_ip_lines(r, "cins")),
+    ("spamhaus_drop", "https://www.spamhaus.org/drop/drop.txt", lambda r: parse_cidr_lines(r, "spamhaus_drop")),
+]
+
+
+def refresh_iocs():
+    ips, cidrs = {}, {}
+    for name, url, parser in IOC_SOURCES:
+        try:
+            part = parser(fetch(url, timeout=90))
+            target = cidrs if name == "spamhaus_drop" else ips
+            for k, srcs in part.items():
+                target.setdefault(k, set()).update(srcs)
+            print(f"ioc/{name}: {len(part):,} entries")
+        except Exception as e:
+            print(f"ioc/{name} failed: {e}")
+    if not ips and not cidrs:
+        print("ioc feeds: nothing fetched; keeping the previous file")
+        return
+    out = {ip: sorted(v) for ip, v in sorted(ips.items())}
+    out["_cidrs"] = {c: sorted(v) for c, v in sorted(cidrs.items())}
+    out["_meta"] = {"as_of": datetime.now().strftime("%Y-%m-%d"), "sources": [n for n, _, _ in IOC_SOURCES]}
+    json.dump(out, open(os.path.join(REF, "ioc_ips.json"), "w"))
+    print(f"ioc feeds: {len(ips):,} IPs + {len(cidrs):,} CIDRs")
 
 
 def load_env():
@@ -106,6 +257,11 @@ def main():
         refresh_geoip()
     except Exception as e:
         print(f"GeoIP refresh failed: {e}")
+    for step in (refresh_exploits, refresh_iocs):
+        try:
+            step()
+        except Exception as e:
+            print(f"{step.__name__} failed: {e}")
     return 0
 
 

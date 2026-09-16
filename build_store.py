@@ -48,6 +48,30 @@ def load_enrichment():
     return kev, epss
 
 
+def load_exploits():
+    """{cve: [sources]} of CVEs with a public exploit / detection template."""
+    d = tr.load_json(os.path.join(SCRIPT_DIR, "reference/exploits.json"), {})
+    return {k: v for k, v in d.items() if not k.startswith("_")}
+
+
+# Registry-driven sector -> tier. High-confidence attribution from the owner
+# registry (Phase 2) beats the keyword classifier; see registry.py.
+SECTOR_TIER = {"critical_infrastructure": "critical_infrastructure", "healthcare": "critical_infrastructure",
+               "energy": "critical_infrastructure", "water": "critical_infrastructure",
+               "telecom": "critical_infrastructure", "government": "government",
+               "education": "education", "out_of_state": "out_of_state_gov",
+               "finance": "small_business", "small_business": "small_business", "other": "small_business"}
+
+
+def load_attributor():
+    try:
+        import registry
+        return registry.Attributor.load(STORE)
+    except Exception as exc:                       # no registry yet — keyword classifier only
+        print(f"Registry: not available ({exc}); using the keyword classifier only")
+        return None
+
+
 def date_from_name(path):
     base = os.path.basename(path)
     return base.replace(".json.gz", "").split("events-")[-1]
@@ -166,7 +190,7 @@ def identity_names(r):
     return names
 
 
-def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
+def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep, exploits=None, attributor=None):
     """Two streaming passes over a daily .gz, writing flattened rows to the open
     temp files obs_fh / vuln_fh. Never holds the full day in memory. Only records
     passing `geokeep(banner)` enter the store — this is the geo gate that keeps
@@ -193,10 +217,23 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             h["cert_orgs"].add(co)                  # CA-issued, non-vendor cert O = owner
     tier_of = {}
     reason_of = {}
+    attr_of = {}
     for ip, h in hosts.items():
         h["hostnames"] = sorted(h["hostnames"])
         h["domains"] = sorted(h["domains"])
         tier_of[ip], reason_of[ip] = tr.classify(h)     # reason kept as an audit trail
+        a = attributor.lookup(ip) if attributor else None
+        if a:
+            attr_of[ip] = a
+            sector = (a.get("sector") or "").split("|")[0]
+            if a.get("confidence") == "high" and sector in SECTOR_TIER and a.get("org_id"):
+                # The registry knows the owner: its sector wins over keywords, but
+                # honeypot evidence still wins over everything.
+                if tier_of[ip] != "honeypot":
+                    tier_of[ip] = SECTOR_TIER[sector]
+                    reason_of[ip] = (f"registry: {a.get('org_name')} ({a.get('method')}, high)"
+                                     + (" [keyword said " + tr.classify(h)[0] + "]"
+                                        if tr.classify(h)[0] != SECTOR_TIER[sector] else ""))
 
     # Pass 2: stream banners → write obs + vuln rows straight to temp files.
     # We keep ONLY the exposure-relevant fields (never the giant http body), so
@@ -236,6 +273,11 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             "banner_ts": r.get("timestamp"),
             "hash": str(r.get("hash")), "tier": tier_of.get(ip),
             "tier_reason": reason_of.get(ip),
+            # Owner registry attribution (Phase 2), any confidence, for the record.
+            "attr_org_id": (attr_of.get(ip) or {}).get("org_id"),
+            "attr_org_name": (attr_of.get(ip) or {}).get("org_name"),
+            "attr_method": (attr_of.get(ip) or {}).get("method"),
+            "attr_confidence": (attr_of.get(ip) or {}).get("confidence"),
             # HTTP identity + TLS certificate (owner evidence; see cert_fields)
             "http_title": http.get("title"), "http_host": http.get("host"),
             "http_server": http.get("server"),
@@ -255,6 +297,8 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
                 # Shodan's own flag: it actually confirmed the CVE on this host
                 # (rare — ~0.01% of rows — but it outranks every version inference).
                 "verified": bool(meta.get("verified")) if isinstance(meta, dict) else False,
+                # A public exploit / template exists (Metasploit, Nuclei): tiebreaker.
+                "has_exploit": cve in (exploits or {}),
             }) + "\n")
             n_vuln += 1
     return date, n_obs, n_vuln, n_dropped
@@ -276,28 +320,70 @@ def copy_to_partition(con, tmp_path, n_rows, out_dir, date, select_sql):
     return out_parquet
 
 
-OBS_SELECT = """
-SELECT CAST(observation_id AS VARCHAR) AS observation_id,
-       CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport,
-       CAST(asn AS VARCHAR) AS asn, org, isp, product, CAST(version AS VARCHAR) AS version,
-       cpe23, service, info, city, region_code, hostnames, domains, tags,
-       CAST(banner_ts AS TIMESTAMP) AS banner_ts, hash, tier,
-       CAST(tier_reason AS VARCHAR) AS tier_reason,
-       CAST(http_title AS VARCHAR) AS http_title, CAST(http_host AS VARCHAR) AS http_host,
-       CAST(http_server AS VARCHAR) AS http_server,
-       CAST(cert_cn AS VARCHAR) AS cert_cn, CAST(cert_org AS VARCHAR) AS cert_org,
-       CAST(cert_issuer AS VARCHAR) AS cert_issuer, CAST(cert_sans AS VARCHAR) AS cert_sans,
-       CAST(cert_expired AS BOOLEAN) AS cert_expired, CAST(cert_expires AS VARCHAR) AS cert_expires,
-       CAST(cert_sha256 AS VARCHAR) AS cert_sha256, CAST(jarm AS VARCHAR) AS jarm
-FROM read_json_auto({src}, format='newline_delimited', maximum_object_size=100000000)
+# Explicit schemas: every column is declared, so an NDJSON row that lacks a key
+# (older temp files, tests, future optional fields) reads as NULL instead of
+# failing the COPY. Keep these in step with build_day()'s dict keys.
+OBS_COLUMNS = {
+    "observation_id": "VARCHAR", "date": "VARCHAR", "ip": "VARCHAR", "port": "INTEGER",
+    "transport": "VARCHAR", "asn": "VARCHAR", "org": "VARCHAR", "isp": "VARCHAR",
+    "product": "VARCHAR", "version": "VARCHAR", "cpe23": "VARCHAR", "service": "VARCHAR",
+    "info": "VARCHAR", "city": "VARCHAR", "region_code": "VARCHAR", "hostnames": "VARCHAR",
+    "domains": "VARCHAR", "tags": "VARCHAR", "banner_ts": "VARCHAR", "hash": "VARCHAR",
+    "tier": "VARCHAR", "tier_reason": "VARCHAR",
+    "attr_org_id": "VARCHAR", "attr_org_name": "VARCHAR", "attr_method": "VARCHAR",
+    "attr_confidence": "VARCHAR",
+    "http_title": "VARCHAR", "http_host": "VARCHAR", "http_server": "VARCHAR",
+    "cert_cn": "VARCHAR", "cert_org": "VARCHAR", "cert_issuer": "VARCHAR", "cert_sans": "VARCHAR",
+    "cert_expired": "BOOLEAN", "cert_expires": "VARCHAR", "cert_sha256": "VARCHAR", "jarm": "VARCHAR",
+}
+VULN_COLUMNS = {
+    "observation_id": "VARCHAR", "date": "VARCHAR", "ip": "VARCHAR", "port": "INTEGER",
+    "transport": "VARCHAR", "cve": "VARCHAR", "cvss": "DOUBLE", "in_kev": "BOOLEAN",
+    "epss": "DOUBLE", "verified": "BOOLEAN", "has_exploit": "BOOLEAN",
+}
+
+
+def _cols(spec):
+    # Doubled braces: the SELECT strings go through str.format(src=...) later.
+    return "{{" + ", ".join(f"'{k}': '{v}'" for k, v in spec.items()) + "}}"
+
+
+OBS_SELECT = f"""
+SELECT * REPLACE (CAST(date AS DATE) AS date, CAST(banner_ts AS TIMESTAMP) AS banner_ts)
+FROM read_json({{src}}, format='newline_delimited', maximum_object_size=100000000,
+               columns={_cols(OBS_COLUMNS)})
 """
-VULN_SELECT = """
-SELECT CAST(observation_id AS VARCHAR) AS observation_id,
-       CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport, cve,
-       CAST(cvss AS DOUBLE) AS cvss, CAST(in_kev AS BOOLEAN) AS in_kev,
-       CAST(epss AS DOUBLE) AS epss, CAST(verified AS BOOLEAN) AS verified
-FROM read_json_auto({src}, format='newline_delimited')
+VULN_SELECT = f"""
+SELECT * REPLACE (CAST(date AS DATE) AS date)
+FROM read_json({{src}}, format='newline_delimited', columns={_cols(VULN_COLUMNS)})
 """
+
+# Internet-facing edge appliances: exploited-in-the-wild population regardless of
+# what CVE mapping Shodan attaches. Regex applied to product / cpe23 / http_title
+# (lower-cased, whole-word where a word is meant). A match is a LEAD to verify.
+APPLIANCE_PATTERNS = [
+    ("Fortinet FortiGate/FortiOS", r"forti(gate|os|web|mail|manager|analyzer)"),
+    ("Ivanti/Pulse Connect Secure", r"\b(ivanti|pulse secure|pulse connect|connect secure)\b"),
+    ("Citrix NetScaler/Gateway", r"\b(netscaler|citrix (gateway|adc))\b"),
+    ("Cisco ASA/FTD/AnyConnect", r"\b(cisco asa|adaptive security appliance|anyconnect|firepower)\b"),
+    ("Cisco IOS XE web UI", r"\bios[ -]xe\b"),
+    ("Palo Alto GlobalProtect/PAN-OS", r"\b(globalprotect|pan-os|palo alto)\b"),
+    ("SonicWall", r"\bsonicwall\b"),
+    ("F5 BIG-IP", r"\bbig-?ip\b"),
+    ("ManageEngine", r"\bmanageengine\b"),
+    ("Microsoft Exchange/OWA", r"\b(outlook web app|exchange server|owa)\b"),
+    ("Zyxel", r"\bzyxel\b"),
+    ("Juniper Junos/SRX", r"\b(junos|juniper)\b"),
+    ("WatchGuard", r"\bwatchguard\b"),
+    ("Barracuda", r"\bbarracuda\b"),
+    ("Check Point", r"\bcheck ?point\b"),
+    ("VMware Horizon/vCenter/ESXi", r"\b(vcenter|esxi|horizon)\b"),
+    ("Progress MOVEit/WS_FTP", r"\b(moveit|ws_ftp)\b"),
+    ("Atlassian Confluence/Jira", r"\b(confluence|jira)\b"),
+    ("GitLab", r"\bgitlab\b"),
+    ("Veeam Backup", r"\bveeam\b"),
+    ("ConnectWise ScreenConnect", r"\b(screenconnect|connectwise)\b"),
+]
 
 # How long an observation counts as "current". The daily query is a DELTA
 # (hosts re-scanned in the window), so a host not seen for a while is UNKNOWN,
@@ -311,10 +397,23 @@ def refresh_views(con):
     """(Re)define views over all parquet partitions + derived analytics."""
     obs_glob = os.path.join(OBS_DIR, "date=*", "*.parquet")
     vuln_glob = os.path.join(VULN_DIR, "date=*", "*.parquet")
-    con.execute(f"CREATE OR REPLACE VIEW observations AS "
-                f"SELECT * FROM read_parquet('{obs_glob}', union_by_name=true)")
-    con.execute(f"CREATE OR REPLACE VIEW vulns AS "
-                f"SELECT * FROM read_parquet('{vuln_glob}', union_by_name=true)")
+
+    def empty_view(name, spec):
+        # A store with no partitions of this kind (fresh store, or no CVEs at
+        # all) still gets a correctly typed, empty view so every join works.
+        cols = ", ".join(f"CAST(NULL AS {t}) AS {c}" for c, t in spec.items())
+        con.execute(f"CREATE OR REPLACE VIEW {name} AS SELECT {cols} WHERE false")
+
+    if glob.glob(obs_glob):
+        con.execute(f"CREATE OR REPLACE VIEW observations AS "
+                    f"SELECT * FROM read_parquet('{obs_glob}', union_by_name=true)")
+    else:
+        empty_view("observations", {**OBS_COLUMNS, "date": "DATE", "banner_ts": "TIMESTAMP"})
+    if glob.glob(vuln_glob):
+        con.execute(f"CREATE OR REPLACE VIEW vulns AS "
+                    f"SELECT * FROM read_parquet('{vuln_glob}', union_by_name=true)")
+    else:
+        empty_view("vulns", {**VULN_COLUMNS, "date": "DATE"})
     # Mixed-schema guard: partitions written before Phase 1 have no
     # observation_id and cannot join to vulns. Say so loudly.
     legacy = con.execute("SELECT count(*) FROM observations WHERE observation_id IS NULL").fetchone()[0]
@@ -352,6 +451,26 @@ def refresh_views(con):
     con.execute("""
         CREATE OR REPLACE VIEW current_state AS
         SELECT * EXCLUDE (days_since_seen, status) FROM exposure_status WHERE status = 'active'
+    """)
+    # Edge appliances currently exposed (Phase 2 appliance-first triage).
+    cases = " ".join(
+        f"WHEN regexp_matches(lower(coalesce(product,'') || ' ' || coalesce(cpe23,'') || ' ' || coalesce(http_title,'')), '{rx}') THEN '{name}'"
+        for name, rx in APPLIANCE_PATTERNS)
+    con.execute(f"""
+        CREATE OR REPLACE VIEW appliance_exposure AS
+        SELECT * FROM (
+          SELECT *, CASE {cases} ELSE NULL END AS appliance FROM current_state
+        ) WHERE appliance IS NOT NULL
+    """)
+    # Free IOC feeds matched locally (reference/ioc_ips.json, refreshed weekly).
+    ioc = tr.load_json(os.path.join(SCRIPT_DIR, "reference", "ioc_ips.json"), {})
+    rows = [(ip, ",".join(srcs)) for ip, srcs in ioc.items() if not ip.startswith("_")]
+    con.execute("CREATE OR REPLACE TABLE ioc_ips (ip VARCHAR, sources VARCHAR)")
+    if rows:
+        con.executemany("INSERT INTO ioc_ips VALUES (?, ?)", rows)
+    con.execute("""
+        CREATE OR REPLACE VIEW ioc_matches AS
+        SELECT cs.*, i.sources AS ioc_sources FROM current_state cs JOIN ioc_ips i ON i.ip = cs.ip
     """)
     # Exposure lifecycle: first/last seen + dwell for each ip:port:transport.
     con.execute("""
@@ -395,6 +514,8 @@ def main():
 
     os.makedirs(STORE, exist_ok=True)
     kev, epss = load_enrichment()
+    exploits = load_exploits()
+    attributor = load_attributor()
 
     # Geo gate: only records that geolocate to the target state (or match a
     # state-named org, for org-rescue) enter the store. Independent MaxMind lookup
@@ -424,7 +545,7 @@ def main():
         of = tempfile.NamedTemporaryFile("w", suffix=".obs.ndjson", delete=False)
         vf = tempfile.NamedTemporaryFile("w", suffix=".vuln.ndjson", delete=False)
         try:
-            date, n_obs, n_vuln, n_drop = build_day(path, kev, epss, of, vf, geokeep)
+            date, n_obs, n_vuln, n_drop = build_day(path, kev, epss, of, vf, geokeep, exploits, attributor)
             of.close(); vf.close()
             copy_to_partition(con, of.name, n_obs, OBS_DIR, date, OBS_SELECT)
             copy_to_partition(con, vf.name, n_vuln, VULN_DIR, date, VULN_SELECT)

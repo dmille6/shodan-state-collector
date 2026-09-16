@@ -88,6 +88,10 @@ fi
 # Project into the store if a file for today exists (partial counts too).
 if ls "$DIR/$OUT_SUBDIR"/*-events-"$TODAY".json.gz >/dev/null 2>&1; then
     "$PY" "$DIR/build_store.py" --date "$TODAY"
+    # Phase 2: refresh the leads table from the updated store (idempotent).
+    if [ -f "$DIR/leads.py" ]; then
+        "$PY" "$DIR/leads.py" refresh || echo "$(ts) - run_nightly: WARNING leads refresh exited $?" >&2
+    fi
 fi
 
 # Compromise tripwire: ask Shodan for hosts it has FLAGGED as compromised/malicious

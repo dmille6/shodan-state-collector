@@ -82,3 +82,27 @@ FROM current_state
 WHERE cert_cn IS NOT NULL AND tier IN ('critical_infrastructure','government','education')
 ORDER BY tier, cert_org
 LIMIT 50;
+
+-- 10) Appliance-first triage: exposed edge appliances on priority tiers, KEV+exploit first
+SELECT a.tier, a.appliance, a.ip, a.port, a.org, a.product, a.http_title,
+       count(DISTINCT CASE WHEN v.in_kev THEN v.cve END)                       AS kev_cves,
+       count(DISTINCT CASE WHEN v.in_kev AND v.has_exploit THEN v.cve END)     AS kev_with_public_exploit
+FROM appliance_exposure a
+LEFT JOIN vulns v ON v.observation_id = a.observation_id AND v.date = a.date
+WHERE a.tier IN ('critical_infrastructure','government','education')
+GROUP BY ALL
+ORDER BY kev_with_public_exploit DESC, kev_cves DESC, a.tier;
+
+-- 11) Exploitable right now: KEV + public exploit/template (Metasploit/Nuclei), verified first
+SELECT cs.tier, cs.ip, cs.port, cs.org, v.cve, v.verified, round(v.epss,3) AS epss
+FROM current_state cs JOIN vulns v ON v.observation_id = cs.observation_id AND v.date = cs.date
+WHERE v.in_kev AND v.has_exploit AND cs.tier IN ('critical_infrastructure','government','education')
+ORDER BY v.verified DESC, v.epss DESC NULLS LAST LIMIT 50;
+
+-- 12) IOC feed matches (free feeds, matched locally). Residential is aggregated, never listed.
+SELECT tier, ioc_sources, count(DISTINCT ip) AS hosts FROM ioc_matches GROUP BY ALL ORDER BY hosts DESC;
+SELECT ip, port, org, tier, ioc_sources FROM ioc_matches WHERE tier <> 'residential' ORDER BY tier;
+
+-- 13) Registry attribution coverage (Phase 2 owner registry)
+SELECT attr_method, attr_confidence, count(DISTINCT ip) AS hosts
+FROM current_state GROUP BY ALL ORDER BY hosts DESC;

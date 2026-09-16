@@ -1,0 +1,101 @@
+"""Tests for the Phase-2 integrator pieces: exploit/IOC feed parsers, has_exploit,
+registry-driven tiering in build_store, and the appliance / ioc views."""
+import json
+import os
+import sys
+import tempfile
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import refresh_reference as rr     # noqa: E402
+import build_store as bs           # noqa: E402
+from tests.test_store_and_watch import banner, run_build_day   # noqa: E402
+
+
+def test_feed_parsers():
+    msf = json.dumps({"exploit/x": {"references": ["CVE-2021-1234", "URL-http://x"]},
+                      "aux/y": {"references": ["cve-2019-0708"]}}).encode()
+    assert rr.parse_metasploit(msf) == {"CVE-2021-1234": {"metasploit"}, "CVE-2019-0708": {"metasploit"}}
+    nuc = b'{"ID":"CVE-2000-0114","Info":{"Name":"x"}}\n{"ID":"not-a-cve"}\n'
+    assert rr.parse_nuclei(nuc) == {"CVE-2000-0114": {"nuclei"}}
+    assert rr.parse_ip_lines(b"# c\n1.2.3.4\n5.6.7.8 # x\nnot an ip\n", "feodo") == {"1.2.3.4": {"feodo"}, "5.6.7.8": {"feodo"}}
+    assert rr.parse_cidr_lines(b"; hdr\n1.2.3.0/24 ; SBL1\n", "spamhaus_drop") == {"1.2.3.0/24": {"spamhaus_drop"}}
+    tf = b'# hdr\n"2026-09-01 00:00:00", "1", "9.9.9.9:443", "ip:port", "botnet_cc"\n'
+    assert rr.parse_threatfox(tf) == {"9.9.9.9": {"threatfox"}}
+    assert rr.parse_urlhaus(b"http://1.1.1.1:8080/bin.sh\nhttp://evil.example/x\n") == {"1.1.1.1": {"urlhaus"}}
+
+
+def test_has_exploit_projected():
+    b = banner(vulns={"CVE-2024-38475": {"verified": False, "cvss": 9.8}, "CVE-2000-0001": {"cvss": 5}})
+    d = tempfile.mkdtemp()
+    gz = os.path.join(d, "louisiana-events-2026-09-01.json.gz")
+    import gzip
+    with gzip.open(gz, "wt") as f:
+        f.write(json.dumps(b) + "\n")
+    of, vf = open(os.path.join(d, "o"), "w"), open(os.path.join(d, "v"), "w")
+    bs.build_day(gz, {"CVE-2024-38475"}, {}, of, vf, lambda r: True, exploits={"CVE-2024-38475": ["nuclei"]})
+    of.close(); vf.close()
+    vul = {json.loads(l)["cve"]: json.loads(l) for l in open(vf.name)}
+    assert vul["CVE-2024-38475"]["has_exploit"] is True and vul["CVE-2000-0001"]["has_exploit"] is False
+
+
+class FakeAttributor:
+    def __init__(self, table): self.table = table
+    def lookup(self, ip): return self.table.get(ip)
+
+
+def test_registry_high_confidence_overrides_keyword_tier():
+    attr = FakeAttributor({"203.0.113.10": {"org_id": "la-ots", "org_name": "Office of Technology Services",
+                                            "sector": "government", "method": "ots_cidr", "confidence": "high"}})
+    b = banner(org="Cox Communications", hostnames=["wsip-1-2-3-4.br.br.cox.net"], domains=["cox.net"])
+    d = tempfile.mkdtemp(); gz = os.path.join(d, "louisiana-events-2026-09-01.json.gz")
+    import gzip
+    with gzip.open(gz, "wt") as f:
+        f.write(json.dumps(b) + "\n")
+    of, vf = open(os.path.join(d, "o"), "w"), open(os.path.join(d, "v"), "w")
+    bs.build_day(gz, set(), {}, of, vf, lambda r: True, attributor=attr)
+    of.close(); vf.close()
+    o = json.loads(open(of.name).readline())
+    assert o["tier"] == "government" and o["tier_reason"].startswith("registry: Office of Technology Services")
+    assert o["attr_org_id"] == "la-ots" and o["attr_confidence"] == "high"
+    # low confidence is recorded but does not override
+    attr2 = FakeAttributor({"203.0.113.10": {"org_id": "", "org_name": "COX-AS", "sector": "", "method": "cymru_asn", "confidence": "low"}})
+    of, vf = open(os.path.join(d, "o2"), "w"), open(os.path.join(d, "v2"), "w")
+    bs.build_day(gz, set(), {}, of, vf, lambda r: True, attributor=attr2)
+    of.close(); vf.close()
+    o = json.loads(open(of.name).readline())
+    assert o["tier"] == "residential" and o["attr_method"] == "cymru_asn"
+
+
+def test_appliance_and_ioc_views():
+    duckdb = pytest.importorskip("duckdb")
+    d = tempfile.mkdtemp()
+    bs.STORE = d; bs.OBS_DIR = os.path.join(d, "observations"); bs.VULN_DIR = os.path.join(d, "vulns")
+    con = duckdb.connect(os.path.join(d, "t.duckdb"))
+    base = {"date": "2026-09-14", "transport": "tcp", "asn": "AS1", "org": "x", "isp": "x", "version": None,
+            "cpe23": "", "service": "https", "info": None, "city": None, "region_code": "LA", "hostnames": "",
+            "domains": "", "tags": "", "banner_ts": None, "hash": "1", "tier": "government", "tier_reason": "r",
+            "attr_org_id": None, "attr_org_name": None, "attr_method": None, "attr_confidence": None,
+            "http_host": None, "http_server": None, "cert_cn": None, "cert_org": None, "cert_issuer": None,
+            "cert_sans": "", "cert_expired": None, "cert_expires": None, "cert_sha256": None, "jarm": None}
+    rows = [dict(base, observation_id="a", ip="10.0.0.1", port=443, product="FortiGate", http_title=None),
+            dict(base, observation_id="b", ip="10.0.0.2", port=443, product=None, http_title="Citrix Gateway"),
+            dict(base, observation_id="c", ip="10.0.0.3", port=80, product="Apache httpd", http_title="Fortitude Bank")]
+    of = open(os.path.join(d, "o.ndjson"), "w")
+    for r in rows:
+        of.write(json.dumps(r) + "\n")
+    of.close()
+    bs.copy_to_partition(con, of.name, 3, bs.OBS_DIR, "2026-09-14", bs.OBS_SELECT)
+    ioc_path = os.path.join(d, "ioc_ips.json")
+    json.dump({"10.0.0.3": ["cins"], "_cidrs": {}, "_meta": {}}, open(ioc_path, "w"))
+    real = bs.tr.load_json
+    bs.tr.load_json = lambda p, default: json.load(open(ioc_path)) if p.endswith("ioc_ips.json") else default
+    try:
+        bs.refresh_views(con)
+    finally:
+        bs.tr.load_json = real
+    appl = dict(con.execute("select ip, appliance from appliance_exposure order by ip").fetchall())
+    assert appl == {"10.0.0.1": "Fortinet FortiGate/FortiOS", "10.0.0.2": "Citrix NetScaler/Gateway"}   # 'Fortitude' is not FortiGate
+    assert con.execute("select ip, ioc_sources from ioc_matches").fetchall() == [("10.0.0.3", "cins")]
