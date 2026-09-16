@@ -144,6 +144,21 @@ LA_EDU_DOMAINS = {"lsu.edu", "lsuhsc.edu", "lsus.edu", "lsua.edu", "lsue.edu", "
 LA_GOV_DOMAINS = {"louisiana.gov", "nola.gov", "brla.gov", "lafayettela.gov",
                   "stpgov.org", "calcasieuparish.gov", "jeffparish.gov", "jeffparish.net",
                   "ebrso.org", "jpso.com", "opcso.org", "lsp.org"}
+# An org that NAMES another state's government is out of scope even when the
+# banner carries no .gov domain ("Commonwealth of PA - OA / Integrated Network
+# Management Services" had 130 such hosts).
+OUT_OF_STATE_ORG_KW = ["commonwealth of pa", "commonwealth of pennsylvania", "commonwealth of virginia",
+                       "commonwealth of kentucky", "commonwealth of massachusetts",
+                       "state of texas", "state of mississippi", "state of arkansas", "state of alabama",
+                       "state of florida", "state of georgia", "state of tennessee", "state of oklahoma",
+                       "state of new york", "state of california", "state of ohio", "state of michigan",
+                       "state of illinois", "state of missouri", "state of north carolina",
+                       "state of south carolina", "state of colorado", "state of arizona",
+                       "state of washington", "state of oregon", "state of nevada", "state of utah",
+                       "state of new jersey", "state of maryland", "state of indiana", "state of wisconsin",
+                       "state of minnesota", "state of iowa", "state of kansas", "state of nebraska",
+                       "texas department of", "mississippi department of", "arkansas department of",
+                       "florida department of", "georgia department of", "alabama department of"]
 US_STATE_CODES = {"al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id",
                   "il", "in", "ia", "ks", "ky", "me", "md", "ma", "mi", "mn", "ms", "mo",
                   "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok", "or",
@@ -327,6 +342,10 @@ def classify(host):
     authoritative_la = "la" in kinds or la_edu or any(is_k12_la(n) for n in names)
     if "other_state" in kinds and not authoritative_la and not kw_in("louisiana", kw_text):
         return "out_of_state_gov", "another state's gov domain"
+    if not authoritative_la and not bulk_network and not kw_in("louisiana", kw_text):
+        kw = first_kw(OUT_OF_STATE_ORG_KW, org_text)
+        if kw:
+            return "out_of_state_gov", f"org names another state's government ('{kw}')"
     # Mixed evidence (a Louisiana name AND another state's name on one IP) stays
     # in scope but is flagged, and the other-state names are removed from the
     # keyword evidence so Pennsylvania's "health" cannot set our sector.

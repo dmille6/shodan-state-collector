@@ -454,3 +454,11 @@ def test_zero_score_flagged_host_appears_in_review_queue(tmp_path):
     assert r.returncode == 0, r.stderr
     text = out.read_text()
     assert "Review queue" in text and "203.0.113.7" in text and "mega-port" in text
+
+
+def test_out_of_state_government_org_without_a_gov_domain():
+    assert tier(org="Commonwealth of PA - OA / Integrated Network Management Services",
+                ports=[443]) == "out_of_state_gov"
+    assert tier(org="State of Texas Department of Information Resources", ports=[443]) == "out_of_state_gov"
+    assert tier(org="State of Louisiana Office of Technology Services", ports=[443]) == "government"
+    assert tier(org="Commonwealth of PA", hostnames=["gis.la.gov"], ports=[443]) == "government"
