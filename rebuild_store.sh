@@ -6,6 +6,11 @@
 #
 #   nohup ./rebuild_store.sh > /tmp/rebuild.log 2>&1 &
 #   grep -c "vuln rows" /tmp/rebuild.log      # days completed so far
+#
+#   --wait   block until the lock is free instead of exiting (e.g. to queue a
+#            rebuild behind the nightly run: sleep until 23:40, then --wait).
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec flock -n "$DIR/.pipeline.lock" "$DIR/venv/bin/python" -u "$DIR/build_store.py" --all --rebuild
+LOCKOPT="-n"
+[ "${1:-}" = "--wait" ] && LOCKOPT=""
+exec flock $LOCKOPT "$DIR/.pipeline.lock" "$DIR/venv/bin/python" -u "$DIR/build_store.py" --all --rebuild

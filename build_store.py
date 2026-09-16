@@ -24,8 +24,10 @@ Usage:
 import argparse
 import glob
 import gzip
+import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -64,6 +66,65 @@ def iter_banners(path):
                 yield r
 
 
+_SAN_RE = re.compile(r"DNS:([^,\s]+)")
+_IPISH = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
+
+
+def observation_id(r):
+    """Stable identity of ONE banner observation. Shodan assigns every banner
+    record a unique id (_shodan.id); fall back to a digest of the fields that
+    make an observation distinct. This is what vulns rows join on — never
+    (ip, port, date), which can attach another same-day banner's CVEs."""
+    sid = (r.get("_shodan") or {}).get("id")
+    if sid:
+        return str(sid)
+    key = f"{r.get('ip_str')}|{r.get('port')}|{r.get('transport')}|{r.get('timestamp')}|{r.get('hash')}"
+    return hashlib.sha1(key.encode()).hexdigest()[:24]
+
+
+def cert_fields(r):
+    """Flatten the TLS certificate: subject CN / O, issuer CN, SAN DNS names,
+    expiry, SHA-256, plus JARM. The subject and SANs are the strongest owner
+    signal in the whole banner (a hospital's cert on a carrier IP names the
+    hospital) — which is why they also feed classification."""
+    ssl = r.get("ssl") or {}
+    cert = ssl.get("cert") or {}
+    subj = cert.get("subject") or {}
+    iss = cert.get("issuer") or {}
+    san_raw = next((e.get("data") for e in (cert.get("extensions") or [])
+                    if e.get("name") == "subjectAltName"), "") or ""
+    sans = sorted({n.lower().rstrip(".") for n in _SAN_RE.findall(san_raw)})
+    fp = cert.get("fingerprint") or {}
+    return {
+        "cert_cn": (subj.get("CN") or None),
+        "cert_org": (subj.get("O") or None),
+        "cert_issuer": (iss.get("CN") or iss.get("O") or None),
+        "cert_sans": ",".join(sans),
+        "cert_expired": cert.get("expired"),
+        "cert_expires": cert.get("expires"),
+        "cert_sha256": fp.get("sha256"),
+        "jarm": ssl.get("jarm"),
+    }
+
+
+def identity_names(r):
+    """Names a banner reveals about its OWNER beyond rDNS: certificate CN and
+    SANs (wildcards stripped) and the HTTP Host header. Fed to classify() as
+    hostnames so a hospital cert on Cox space attributes the hospital."""
+    names = set()
+    cf = cert_fields(r)
+    for n in ([cf["cert_cn"]] if cf["cert_cn"] else []) + cf["cert_sans"].split(","):
+        n = (n or "").lower().strip().rstrip(".")
+        if n.startswith("*."):
+            n = n[2:]
+        if n and "." in n and " " not in n and not _IPISH.match(n):
+            names.add(n)
+    host = ((r.get("http") or {}).get("host") or "").lower().strip().rstrip(".")
+    if host and "." in host and not _IPISH.match(host.split(":")[0]):
+        names.add(host.split(":")[0])
+    return names
+
+
 def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
     """Two streaming passes over a daily .gz, writing flattened rows to the open
     temp files obs_fh / vuln_fh. Never holds the full day in memory. Only records
@@ -79,12 +140,16 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             continue
         h = hosts.setdefault(r["ip_str"], {"org": None, "ports": set(),
                                            "hostnames": set(), "domains": set(),
-                                           "tags": set()})
+                                           "tags": set(), "cert_orgs": set()})
         h["org"] = h["org"] or r.get("org")
         h["ports"].add(r.get("port"))
         h["hostnames"].update(r.get("hostnames") or [])
+        h["hostnames"].update(identity_names(r))    # cert CN/SANs + HTTP Host
         h["domains"].update(r.get("domains") or [])
         h["tags"].update(r.get("tags") or [])       # honeypot tag feeds classify()
+        co = cert_fields(r)["cert_org"]
+        if co:
+            h["cert_orgs"].add(co)                  # cert subject O = self-asserted owner
     tier_of = {}
     for ip, h in hosts.items():
         h["hostnames"] = sorted(h["hostnames"])
@@ -102,7 +167,10 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
         ip = r["ip_str"]
         port = r.get("port")
         loc = r.get("location") or {}
+        oid = observation_id(r)
+        http = r.get("http") or {}
         obs_fh.write(json.dumps({
+            "observation_id": oid,
             "date": date, "ip": ip, "port": port,
             "transport": r.get("transport"), "asn": r.get("asn"),
             "org": r.get("org"), "isp": r.get("isp"),
@@ -125,6 +193,10 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             # us tell a fresh observation from a re-served cached banner.
             "banner_ts": r.get("timestamp"),
             "hash": str(r.get("hash")), "tier": tier_of.get(ip),
+            # HTTP identity + TLS certificate (owner evidence; see cert_fields)
+            "http_title": http.get("title"), "http_host": http.get("host"),
+            "http_server": http.get("server"),
+            **cert_fields(r),
         }) + "\n")
         n_obs += 1
         for cve, meta in (r.get("vulns") or {}).items():
@@ -134,8 +206,12 @@ def build_day(path, kev, epss, obs_fh, vuln_fh, geokeep):
             except (TypeError, ValueError):
                 cvss = None
             vuln_fh.write(json.dumps({
-                "date": date, "ip": ip, "port": port, "cve": cve,
-                "cvss": cvss, "in_kev": cve in kev, "epss": epss.get(cve),
+                "observation_id": oid,
+                "date": date, "ip": ip, "port": port, "transport": r.get("transport"),
+                "cve": cve, "cvss": cvss, "in_kev": cve in kev, "epss": epss.get(cve),
+                # Shodan's own flag: it actually confirmed the CVE on this host
+                # (rare — ~0.01% of rows — but it outranks every version inference).
+                "verified": bool(meta.get("verified")) if isinstance(meta, dict) else False,
             }) + "\n")
             n_vuln += 1
     return date, n_obs, n_vuln, n_dropped
@@ -158,18 +234,33 @@ def copy_to_partition(con, tmp_path, n_rows, out_dir, date, select_sql):
 
 
 OBS_SELECT = """
-SELECT CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport,
+SELECT CAST(observation_id AS VARCHAR) AS observation_id,
+       CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport,
        CAST(asn AS VARCHAR) AS asn, org, isp, product, CAST(version AS VARCHAR) AS version,
        cpe23, service, info, city, region_code, hostnames, domains, tags,
-       CAST(banner_ts AS TIMESTAMP) AS banner_ts, hash, tier
+       CAST(banner_ts AS TIMESTAMP) AS banner_ts, hash, tier,
+       CAST(http_title AS VARCHAR) AS http_title, CAST(http_host AS VARCHAR) AS http_host,
+       CAST(http_server AS VARCHAR) AS http_server,
+       CAST(cert_cn AS VARCHAR) AS cert_cn, CAST(cert_org AS VARCHAR) AS cert_org,
+       CAST(cert_issuer AS VARCHAR) AS cert_issuer, CAST(cert_sans AS VARCHAR) AS cert_sans,
+       CAST(cert_expired AS BOOLEAN) AS cert_expired, CAST(cert_expires AS VARCHAR) AS cert_expires,
+       CAST(cert_sha256 AS VARCHAR) AS cert_sha256, CAST(jarm AS VARCHAR) AS jarm
 FROM read_json_auto({src}, format='newline_delimited', maximum_object_size=100000000)
 """
 VULN_SELECT = """
-SELECT CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, cve,
+SELECT CAST(observation_id AS VARCHAR) AS observation_id,
+       CAST(date AS DATE) AS date, ip, CAST(port AS INTEGER) AS port, transport, cve,
        CAST(cvss AS DOUBLE) AS cvss, CAST(in_kev AS BOOLEAN) AS in_kev,
-       CAST(epss AS DOUBLE) AS epss
+       CAST(epss AS DOUBLE) AS epss, CAST(verified AS BOOLEAN) AS verified
 FROM read_json_auto({src}, format='newline_delimited')
 """
+
+# How long an observation counts as "current". The daily query is a DELTA
+# (hosts re-scanned in the window), so a host not seen for a while is UNKNOWN,
+# not remediated — but it is also not "exposed right now". Measured: banner_ts
+# minus collection date is 0-1 days at p99, so `date` is a reliable last-seen.
+ACTIVE_DAYS = 14      # current_state: seen within this many days of the newest day
+STALE_DAYS = 45       # exposure_status: 'stale' up to here, 'gone' after
 
 
 def refresh_views(con):
@@ -180,13 +271,33 @@ def refresh_views(con):
                 f"SELECT * FROM read_parquet('{obs_glob}', union_by_name=true)")
     con.execute(f"CREATE OR REPLACE VIEW vulns AS "
                 f"SELECT * FROM read_parquet('{vuln_glob}', union_by_name=true)")
-    # Latest banner per ip:port (the current picture).
+    # Latest banner per ip:port:transport, ALL-TIME, with a deterministic order
+    # (banner scan time, then collection date, then the record id) so the same
+    # inputs always pick the same row.
     con.execute("""
-        CREATE OR REPLACE VIEW current_state AS
+        CREATE OR REPLACE VIEW latest_observed AS
         SELECT * EXCLUDE (rn) FROM (
-          SELECT *, row_number() OVER (PARTITION BY ip, port ORDER BY date DESC) AS rn
+          SELECT *, row_number() OVER (
+                   PARTITION BY ip, port, transport
+                   ORDER BY banner_ts DESC NULLS LAST, date DESC, observation_id DESC) AS rn
           FROM observations
         ) WHERE rn = 1
+    """)
+    # Freshness. current_state = "exposed right now" = latest observation seen
+    # within ACTIVE_DAYS of the newest day in the store. exposure_status keeps
+    # every latest observation and labels it active / stale / gone.
+    con.execute(f"""
+        CREATE OR REPLACE VIEW exposure_status AS
+        SELECT *,
+               date_diff('day', date, (SELECT max(date) FROM observations)) AS days_since_seen,
+               CASE WHEN date_diff('day', date, (SELECT max(date) FROM observations)) <= {ACTIVE_DAYS} THEN 'active'
+                    WHEN date_diff('day', date, (SELECT max(date) FROM observations)) <= {STALE_DAYS} THEN 'stale'
+                    ELSE 'gone' END AS status
+        FROM latest_observed
+    """)
+    con.execute("""
+        CREATE OR REPLACE VIEW current_state AS
+        SELECT * EXCLUDE (days_since_seen, status) FROM exposure_status WHERE status = 'active'
     """)
     # Exposure lifecycle: first/last seen + dwell for each ip:port.
     con.execute("""

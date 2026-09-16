@@ -121,8 +121,12 @@ date, so each run separates **NEW** hosts from **ONGOING** ones. Only a genuinel
 host prints the loud `ALERT` block and exits `10`; ongoing hosts are archived and
 noted in one quiet line (exit `0`) — the recurring-alert fatigue is gone. Hosts that
 stop matching are reported as `CLEARED`, and stale banners are annotated with how
-long ago Shodan last scanned. Exit codes: `0` clean or ongoing-only, `10` **new**
-hit(s). It runs nightly from `run_nightly.sh` after the census (without affecting the
+long ago Shodan last scanned. A host that had cleared and is flagged again is
+**RECURRED** and alerts like a new one. If a Shodan count or search fails, the
+run is **INCOMPLETE** (exit `5`): nothing is marked cleared and the active set
+is carried forward, because "no result" is not "resolved". Exit codes: `0` clean
+or ongoing-only, `10` **new or recurred** hit(s), `5` provider failure. It runs
+nightly from `run_nightly.sh` after the census (without affecting the
 collector's own exit status).
 
 ## Sector tiers (`triage_report.classify`)
@@ -166,6 +170,23 @@ flock -n .pipeline.lock ./venv/bin/python build_store.py --all --rebuild   # re-
 ```
 
 Add the misfiring host to `tests/test_classify.py` first, then fix the rule.
+
+## The analytical store (`build_store.py`)
+
+Each daily archive is projected into `store/` (Parquet per day + a DuckDB with
+views). Raw archives stay the system of record; the store is rebuildable with
+`./rebuild_store.sh`. Per observation it keeps the exposure-relevant fields —
+never the HTTP body — plus, since Phase 1: an `observation_id` (Shodan's record
+id, what `vulns` joins on), the TLS certificate (`cert_cn`, `cert_org`,
+`cert_sans`, issuer, expiry, SHA-256, JARM) and the HTTP title / host / server.
+Certificate names and the HTTP Host header also feed the classifier as owner
+identity — a hospital's certificate on carrier space attributes the hospital.
+
+Freshness: `latest_observed` is the latest banner per ip:port:transport over all
+time; `exposure_status` labels each one `active` (seen in the last 14 days),
+`stale` (15–45) or `gone`; `current_state` is the active subset — "exposed
+right now". A host not seen recently is *unknown*, not remediated: the daily
+query is a delta of re-scanned hosts.
 
 ## Daily cron (runs as the owning user, e.g. mike)
 
@@ -251,11 +272,14 @@ Files you may find beside a day's archive and what they mean:
    states. The org-rescue query is most reliable for states whose name appears in
    org names (e.g. Louisiana); set `SHODAN_ORG_RESCUE=false` otherwise.
 
-6. **~40% of raw search results are duplicate hashes.** Shodan returns the same
-   banner across multiple pages, so a *complete* download of ~31k reported results
+6. **~40% of raw search results are duplicates.** Shodan returns the same banner
+   record across multiple pages, so a *complete* download of ~31k reported results
    yields only ~19k unique records after dedup. Measure download completeness by
    **raw banners fetched vs the reported total**, never by unique-after-dedup —
-   the latter falsely flags every healthy run as partial.
+   the latter falsely flags every healthy run as partial. Dedup is per
+   **observation** (Shodan's `_shodan.id`), never by banner `hash` alone: two
+   different hosts serving a byte-identical banner share a hash, and the old
+   hash-only key silently dropped the second host.
 
 7. **The CLI hides partial downloads; pacing avoids them.** `shodan download`
    exits 0 even when it saved 5% of the results, and hammering the API with

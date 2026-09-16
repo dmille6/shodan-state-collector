@@ -11,7 +11,8 @@ this paginates the Shodan search API directly so it can:
   * pace requests (~1 req/sec) to stay under the rate limit and AVOID the
     throttling that truncates the CLI,
   * know exactly how many records it pulled vs the query's reported total, and
-  * stream straight to gzipped NDJSON (low memory), deduped by banner hash.
+  * stream straight to gzipped NDJSON (low memory), deduped per observation
+    (Shodan record id), so identical banners on different hosts are all kept.
 
 Output matches the bash collector: daily_downloads/<name>-events-<DATE>.json.gz,
 one Shodan banner per line.
@@ -140,8 +141,22 @@ def collect_query(api, query, out, seen, page_pause, retries, backoff, geokeep):
     return saved, raw, total, last_good, dropped
 
 
+def observation_key(banner):
+    """Identity of ONE observation for de-duplication. Shodan returns the same
+    banner record across pages (that is the ~40% duplicate rate); those repeats
+    share Shodan's own record id (_shodan.id). Two DIFFERENT hosts serving a
+    byte-identical banner share only the content `hash` — the old hash-only key
+    silently dropped the second host, exactly the default-config device fleets
+    this census exists to find."""
+    sid = (banner.get("_shodan") or {}).get("id")
+    if sid:
+        return ("id", sid)
+    return ("obs", banner.get("ip_str"), banner.get("port"), banner.get("transport"),
+            banner.get("timestamp"), banner.get("hash"))
+
+
 def _write_matches(matches, out, seen, geokeep):
-    """Write banners not already seen (dedup by hash, fallback ip:port:ts).
+    """Write banners not already seen (dedup by observation_key()).
     `geokeep(banner)` must return True to keep it — records failing the geo check
     are dropped (this is what prevents worldwide pollution from a broken filter).
     Returns (n_written, n_geo_dropped)."""
@@ -150,9 +165,7 @@ def _write_matches(matches, out, seen, geokeep):
         if not geokeep(banner):
             dropped += 1
             continue
-        key = banner.get("hash")
-        if key is None:
-            key = f"{banner.get('ip_str')}:{banner.get('port')}:{banner.get('timestamp')}"
+        key = observation_key(banner)
         if key in seen:
             continue
         seen.add(key)

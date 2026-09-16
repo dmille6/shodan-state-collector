@@ -35,8 +35,9 @@ ONGOING ones Shodan has been flagging for days (one quiet line, exit 0). Recurri
 stale hits therefore no longer cause nightly alert fatigue, and a genuinely new
 compromised host stands out. Hosts that stop being flagged are noted as CLEARED.
 
-Exit codes: 0 clean or ongoing-only (nothing new), 10 NEW hit(s) — investigate,
-1 setup error.
+Exit codes: 0 clean or ongoing-only (nothing new), 10 NEW or RECURRED hit(s) —
+investigate, 5 provider failure (a count or search failed: the run is
+INCOMPLETE and nothing was marked cleared), 1 setup error.
 """
 import argparse
 import gzip
@@ -157,6 +158,46 @@ def save_ledger(ledger):
     os.replace(tmp, LEDGER_PATH)
 
 
+def reconcile(hosts, ledger, iso, failed=()):
+    """Split this run's hits against the ledger and roll the ledger forward.
+    Returns (new_ips, ongoing_ips, cleared_ips, recurred_ips), all sorted.
+
+      new       never in the ledger
+      recurred  in the ledger but NOT in the previous run's active set — it had
+                cleared and is back, which is as alarming as new
+      ongoing   in the previous run's active set
+      cleared   in the previous active set, absent now — ONLY when no selector
+                failed; a provider failure carries the active set forward
+                unchanged, because "no result" is not "resolved".
+    Every host seen is recorded (first_seen preserved) regardless of failures."""
+    prior_hosts = ledger["hosts"]
+    prev_active = set(ledger["_meta"].get("last_run_active", []))
+    current_active = set(hosts)
+
+    new_ips = sorted(ip for ip in hosts if ip not in prior_hosts)
+    recurred_ips = sorted(ip for ip in hosts if ip in prior_hosts and ip not in prev_active)
+    ongoing_ips = sorted(ip for ip in hosts if ip in prev_active)
+    cleared_ips = [] if failed else sorted(prev_active - current_active)
+
+    for ip, h in hosts.items():
+        banner_ts = max((b.get("timestamp") or "" for b in h["banners"]), default="")
+        rec = prior_hosts.get(ip) or {"first_seen": iso}
+        rec["last_seen"] = iso
+        rec["selectors"] = sorted(set(rec.get("selectors", [])) | set(h["selectors"]))
+        if banner_ts:
+            rec["last_banner_ts"] = banner_ts
+        prior_hosts[ip] = rec
+    if failed:
+        # Keep hosts we could not re-check as active; add the ones we did see.
+        ledger["_meta"]["last_run_active"] = sorted(prev_active | current_active)
+        ledger["_meta"]["last_run_incomplete"] = {"date": iso, "failed": sorted(failed)}
+    else:
+        ledger["_meta"]["last_run_active"] = sorted(current_active)
+        ledger["_meta"].pop("last_run_incomplete", None)
+    ledger["_meta"]["last_run_date"] = iso
+    return new_ips, ongoing_ips, cleared_ips, recurred_ips
+
+
 def staleness_note(banner_ts, iso):
     """Flag when Shodan's flagged banner is old — the tag persists on a cached
     scan, so a recurring hit isn't necessarily a fresh observation."""
@@ -224,14 +265,20 @@ def main():
     hosts = {}                 # ip -> aggregated host record
     total_matches = 0
     off_target = 0
+    failed = []                # selectors whose count or search FAILED (not "zero")
     for label, query in selectors:
         n = count(api, query)
         log(f"  {label:22} count={n if n >= 0 else 'ERR'}")
-        if n <= 0:
+        if n < 0:
+            failed.append(label)
+            continue
+        if n == 0:
             continue
         if args.dry_run:
             continue
+        got = 0
         for banner in search_all(api, query):
+            got += 1
             total_matches += 1
             if not in_state(banner):
                 off_target += 1
@@ -256,6 +303,11 @@ def main():
             h["selectors"].add(label)
             banner["_compromise_selector"] = label
             h["banners"].append(banner)
+        if got == 0:
+            # count said > 0 but the paid search returned nothing: a provider
+            # failure, not an empty result. Must not be read as "cleared".
+            failed.append(label)
+            log(f"    {label}: count={n} but search returned no banners — treating as FAILED")
 
     n_hits = len(hosts)
 
@@ -263,36 +315,27 @@ def main():
         log("Dry-run complete — counts above only (no credits spent, nothing archived).")
         return 0
 
-    # --- Reconcile against the ledger to separate NEW from ONGOING and detect
-    # hosts that have CLEARED (were flagged before, no longer are). This is what
-    # keeps the tripwire from screaming the same stale hosts every night. ---
+    # --- Reconcile against the ledger: NEW / RECURRED / ONGOING / CLEARED. ---
     ledger = load_ledger()
     prior_hosts = ledger["hosts"]
-    prev_active = set(ledger["_meta"].get("last_run_active", []))
-    current_active = set(hosts)
+    new_ips, ongoing_ips, cleared_ips, recurred_ips = reconcile(hosts, ledger, iso, failed)
 
-    new_ips = sorted(ip for ip in hosts if ip not in prior_hosts)
-    ongoing_ips = sorted(ip for ip in hosts if ip in prior_hosts)
-    cleared_ips = sorted(prev_active - current_active)
-
-    # Roll the ledger forward (preserving each host's first_seen).
-    for ip, h in hosts.items():
-        banner_ts = max((b.get("timestamp") or "" for b in h["banners"]), default="")
-        rec = prior_hosts.get(ip) or {"first_seen": iso}
-        rec["last_seen"] = iso
-        rec["selectors"] = sorted(set(rec.get("selectors", [])) | h["selectors"])
-        if banner_ts:
-            rec["last_banner_ts"] = banner_ts
-        prior_hosts[ip] = rec
-    ledger["_meta"]["last_run_active"] = sorted(current_active)
-    ledger["_meta"]["last_run_date"] = iso
-
+    if failed:
+        log(f"WARNING: {len(failed)} selector(s) FAILED ({', '.join(failed)}) — this run is "
+            f"INCOMPLETE: nothing is marked cleared, the active set is carried forward.")
     if cleared_ips:
         log(f"NOTE: {len(cleared_ips)} previously-flagged host(s) no longer flagged: "
             f"{', '.join(cleared_ips)}")
+    if recurred_ips:
+        log(f"NOTE: {len(recurred_ips)} host(s) flagged AGAIN after having cleared: "
+            f"{', '.join(recurred_ips)} — treated as new.")
+    new_ips = sorted(set(new_ips) | set(recurred_ips))
 
     if n_hits == 0:
         save_ledger(ledger)
+        if failed:
+            log(f"Tripwire INCOMPLETE for {iso}: no hits seen, but {len(failed)} selector(s) failed.")
+            return 5
         log(f"No compromise-flagged hosts in {state_code} for {iso}. Tripwire quiet."
             f"{f' ({off_target} off-target match(es) dropped by geo gate)' if off_target else ''}")
         return 0
@@ -315,7 +358,9 @@ def main():
     def line(ip):
         h = hosts[ip]
         note = staleness_note(prior_hosts[ip].get("last_banner_ts"), iso)
-        if ip in new_ips:
+        if ip in recurred_ips:
+            status = f"[RECURRED, first {prior_hosts[ip].get('first_seen', '?')}]"
+        elif ip in new_ips:
             status = "[NEW]"
         else:
             status = f"[ongoing since {prior_hosts[ip].get('first_seen', '?')}]"
@@ -348,7 +393,7 @@ def main():
     # Only known hosts, nothing new — stay quiet (one line, exit 0) to avoid fatigue.
     log(f"Tripwire: {len(ongoing_ips)} ongoing flagged host(s), 0 new "
         f"({', '.join(ongoing_ips)}). No new alert. Archived {os.path.relpath(gz_path, SCRIPT_DIR)}.")
-    return 0
+    return 5 if failed else 0
 
 
 if __name__ == "__main__":

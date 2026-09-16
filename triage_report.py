@@ -315,10 +315,13 @@ def classify(host):
                      and any(pat in h for pat in RESI_HOST_RE)]
     customer_names = [h for h in hostnames if h not in carrier_names]
     customer_domains = [d for d in domains if not any(_is_or_under(d, c) for c in CARRIER_DOMAINS)]
+    # Organisation names the host asserts about ITSELF (TLS certificate subject
+    # O). Customer-provided, so trusted like hostnames, never like the carrier org.
+    cert_orgs = [o.lower().strip() for o in (host.get("cert_orgs") or []) if o and o.strip()]
     # Names are joined with " | " — not a phrase separator — so a keyword
     # phrase ("city of") or a parish-plus-civic pairing can never be assembled
     # out of two unrelated names.
-    identity_text = " | ".join(customer_names + customer_domains)
+    identity_text = " | ".join(customer_names + customer_domains + cert_orgs)
 
     bulk_network = first_kw(BULK_NETWORK_KW, org_text) is not None
     transit = first_kw(TRANSIT_HOST_KW, org_text) is not None
@@ -397,7 +400,7 @@ def classify(host):
 
     # 5. A parish name counts only beside a civic noun ("Cameron Parish",
     #    "parish of Cameron", "Cameron Sheriff"), never on its own.
-    parish_fields = customer_names + customer_domains + ([] if bulk_network else [org_text])
+    parish_fields = customer_names + customer_domains + cert_orgs + ([] if bulk_network else [org_text])
     for par in PARISHES:
         for field in parish_fields:
             civic = near_civic(par, field)
@@ -411,7 +414,7 @@ def classify(host):
     #    not a known carrier domain, is customer identity -> a business.
     # A real customer identity, or a non-bulk org name: a specific (small)
     # business — kept as a reviewable lead even on a mega-port host.
-    if customer_names or customer_domains or (org_text.strip() and not bulk_network):
+    if customer_names or customer_domains or cert_orgs or (org_text.strip() and not bulk_network):
         return "small_business", "commercial org, not gov/edu/infra" + flag
     # 7. Nothing attributes this mega-port host: honeypot / scanner / NAT.
     if megaport:
@@ -448,7 +451,8 @@ def main():
                 continue
             h = hosts.setdefault(ip, {"org": None, "ports": set(), "products": set(),
                                       "hostnames": set(), "domains": set(),
-                                      "cves": set(), "city": None, "tags": set()})
+                                      "cves": set(), "city": None, "tags": set(),
+                                      "cert_orgs": set()})
             h["org"] = h["org"] or r.get("org")
             h["ports"].add(r.get("port"))
             if r.get("product"):
@@ -456,6 +460,9 @@ def main():
             h["hostnames"].update(r.get("hostnames") or [])
             h["domains"].update(r.get("domains") or [])
             h["tags"].update(r.get("tags") or [])
+            co = (((r.get("ssl") or {}).get("cert") or {}).get("subject") or {}).get("O")
+            if co:
+                h["cert_orgs"].add(co)
             loc = r.get("location") or {}
             h["city"] = h["city"] or loc.get("city")
             for c in (r.get("vulns") or {}):

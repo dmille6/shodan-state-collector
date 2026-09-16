@@ -462,3 +462,13 @@ def test_out_of_state_government_org_without_a_gov_domain():
     assert tier(org="State of Texas Department of Information Resources", ports=[443]) == "out_of_state_gov"
     assert tier(org="State of Louisiana Office of Technology Services", ports=[443]) == "government"
     assert tier(org="Commonwealth of PA", hostnames=["gis.la.gov"], ports=[443]) == "government"
+
+
+def test_certificate_organisation_is_trusted_identity():
+    h = host(org="Cox Communications", hostnames=["wsip-1-2-3-4.br.br.cox.net"], domains=["cox.net"], ports=[443])
+    h["cert_orgs"] = {"Our Lady of the Lake Regional Medical Center"}
+    assert classify(h)[0] == "critical_infrastructure"
+    h["cert_orgs"] = {"Jefferson Parish Sheriff's Office"}
+    assert classify(h)[0] == "government"
+    h["cert_orgs"] = {"Acme Widgets LLC"}
+    assert classify(h)[0] == "small_business"

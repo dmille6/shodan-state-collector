@@ -1,7 +1,13 @@
 -- queries.sql — starter analytical queries for the exposure store.
 --   duckdb store/exposure.duckdb
--- then paste any query below. Views: observations, vulns, current_state, lifecycle.
--- Data is PASSIVE and version-inferred — findings are LEADS TO VERIFY, not incidents.
+-- then paste any query below.
+-- Views: observations, vulns (one row per CVE per observation; join on
+-- observation_id), latest_observed (latest banner per ip:port:transport, all
+-- time), exposure_status (latest_observed + status active/stale/gone by days
+-- since seen), current_state (= exposure_status WHERE status = 'active', i.e.
+-- seen in the last 14 days — "exposed right now"), lifecycle (first/last seen).
+-- Data is PASSIVE and version-inferred — findings are LEADS TO VERIFY, not
+-- incidents. vulns.verified = Shodan confirmed the CVE on the host (rare).
 
 -- 1) Daily accounting: hosts + KEV-vuln hosts by sector tier (current picture)
 SELECT cs.tier,
@@ -9,17 +15,18 @@ SELECT cs.tier,
        count(DISTINCT cs.ip)                           AS unique_hosts,
        count(DISTINCT CASE WHEN v.in_kev THEN cs.ip END) AS hosts_with_kev
 FROM current_state cs
-LEFT JOIN vulns v ON v.ip = cs.ip AND v.port = cs.port AND v.date = cs.date
+LEFT JOIN vulns v ON v.observation_id = cs.observation_id
 GROUP BY cs.tier
 ORDER BY hosts_with_kev DESC;
 
 -- 2) Top actionable exposures right now: KEV-listed CVEs on gov/critical-infra
-SELECT cs.tier, cs.ip, cs.org, cs.city, v.cve, v.cvss, round(v.epss,3) AS epss
+--    (verified first — Shodan confirmed it — then by exploit probability)
+SELECT cs.tier, cs.ip, cs.org, cs.city, v.cve, v.verified, v.cvss, round(v.epss,3) AS epss
 FROM current_state cs
-JOIN vulns v ON v.ip = cs.ip AND v.port = cs.port AND v.date = cs.date
+JOIN vulns v ON v.observation_id = cs.observation_id
 WHERE v.in_kev
   AND cs.tier IN ('critical_infrastructure','government','education')
-ORDER BY v.epss DESC NULLS LAST, v.cvss DESC
+ORDER BY v.verified DESC, v.epss DESC NULLS LAST, v.cvss DESC
 LIMIT 25;
 
 -- 3) NEW exposures on the most recent day (ip:port never seen before)
@@ -51,7 +58,7 @@ SELECT cs.org, cs.tier,
        count(DISTINCT CASE WHEN v.in_kev THEN v.cve END)  AS kev_cves,
        round(max(v.epss),3)                               AS worst_epss
 FROM current_state cs
-LEFT JOIN vulns v ON v.ip = cs.ip AND v.port = cs.port AND v.date = cs.date
+LEFT JOIN vulns v ON v.observation_id = cs.observation_id
 GROUP BY cs.org, cs.tier
 HAVING kev_cves > 0
 ORDER BY kev_cves DESC
@@ -63,3 +70,15 @@ FROM observations
 WHERE port IN (502,20000,47808,102,44818,1911,2404,789)
   AND date = (SELECT max(date) FROM observations)
 ORDER BY org;
+
+
+-- 8) Freshness accounting: how much of "latest observed" is actually current?
+SELECT status, count(*) AS services, count(DISTINCT ip) AS hosts
+FROM exposure_status GROUP BY status ORDER BY status;
+
+-- 9) Who owns it? Certificate subject / SANs and HTTP Host beside the carrier org
+SELECT ip, port, org, cert_org, cert_cn, cert_sans, http_host, tier
+FROM current_state
+WHERE cert_cn IS NOT NULL AND tier IN ('critical_infrastructure','government','education')
+ORDER BY tier, cert_org
+LIMIT 50;

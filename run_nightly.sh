@@ -102,6 +102,8 @@ fi
 watch_rc=$?
 if [ "$watch_rc" -eq 10 ]; then
     echo "$(ts) - run_nightly: COMPROMISE TRIPWIRE FIRED — see the ALERT block above and $DIR/compromise_hits/" >&2
+elif [ "$watch_rc" -eq 5 ]; then
+    echo "$(ts) - run_nightly: WARNING compromise tripwire INCOMPLETE (a Shodan count/search failed) — nothing marked cleared" >&2
 fi
 
 summary="$(grep -h "Wrote .* unique records .*$TODAY" "$DIR/shodan_collection.log" 2>/dev/null | tail -1)"
