@@ -241,8 +241,13 @@ def main():
             flags.append(f"GTI/VT: {g['malicious']} engines malicious")
         if g.get("ok") and g.get("gti_assessment") in ("MALICIOUS", "SUSPICIOUS"):
             flags.append(f"GTI verdict {g['gti_assessment']}")
-        if g.get("ok") and (g.get("communicating_files") or 0) > 0:
-            flags.append(f"{g['communicating_files']} malware samples communicated with it")
+        # Communicating files: only samples that engines actually call malicious
+        # count (benign tools also phone home to public servers).
+        bad = [x for x in (g.get("communicating_sample") or []) if (x.get("malicious") or 0) >= 5]
+        if g.get("ok") and bad:
+            worst = max(x.get("malicious") or 0 for x in bad)
+            flags.append(f"{len(bad)} MALWARE sample{'s' if len(bad) > 1 else ''} communicated with it "
+                         f"(up to {worst} engines): {', '.join((x.get('sha256') or '')[:12] for x in bad[:3])}")
         if a.get("ok") and (a.get("abuse_confidence") or 0) >= 50:
             flags.append(f"AbuseIPDB {a['abuse_confidence']}% ({a.get('reports')} reports)")
         if o.get("ok") and (o.get("pulses") or 0) >= 3:
